@@ -7,7 +7,9 @@ import time
 from typing import Any
 
 from aiohttp import web
+from curl_cffi import CurlOpt
 from curl_cffi.requests import AsyncSession
+from curl_cffi.requests.exceptions import RequestException
 
 from codex_proxy.auth import ensure_credentials, extract_account_id
 from codex_proxy.config import CODEX_MODELS, RESPONSES_ENDPOINT
@@ -49,6 +51,9 @@ _UNSUPPORTED_RESPONSES_PARAMS = {
     "max_tokens",
     "max_completion_tokens",
 }
+_UPSTREAM_TIMEOUT_SECONDS = 120
+_MAX_UPSTREAM_ATTEMPTS = 2
+_RETRIABLE_UPSTREAM_ERROR_CODES = {18, 35, 52, 55, 56, 92}
 
 
 def _normalize_tool_strict(value: Any) -> bool:
@@ -188,6 +193,90 @@ def _build_upstream_headers(credentials: dict[str, Any], accept: str) -> dict[st
         "Content-Type": "application/json",
         "Accept": accept,
     }
+
+
+def _make_stream_response() -> web.StreamResponse:
+    """Build a standard SSE response for downstream clients."""
+    response = web.StreamResponse()
+    response.content_type = "text/event-stream"
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["Connection"] = "keep-alive"
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
+
+
+async def _ensure_stream_prepared(
+    response: web.StreamResponse, request: web.Request
+) -> web.StreamResponse:
+    """Prepare an SSE response exactly once."""
+    if not response.prepared:
+        await response.prepare(request)
+    return response
+
+
+def _build_error_payload(message: str, error_type: str, detail: str | None = None) -> dict[str, Any]:
+    """Build a standard OpenAI-style error payload."""
+    error: dict[str, Any] = {"message": message, "type": error_type}
+    if detail:
+        error["detail"] = detail
+    return {"error": error}
+
+
+async def _write_chat_stream_error(
+    request: web.Request,
+    response: web.StreamResponse,
+    message: str,
+    error_type: str,
+    detail: str | None = None,
+) -> web.StreamResponse:
+    """Write a downstream chat-completions SSE error and terminate the stream."""
+    payload = _build_error_payload(message, error_type, detail)
+    await _ensure_stream_prepared(response, request)
+    await response.write(f"data: {json.dumps(payload)}\n\n".encode())
+    await response.write(b"data: [DONE]\n\n")
+    return response
+
+
+async def _write_responses_stream_error(
+    request: web.Request,
+    response: web.StreamResponse,
+    message: str,
+    error_type: str,
+    detail: str | None = None,
+) -> web.StreamResponse:
+    """Write a downstream Responses-API SSE error and terminate the stream."""
+    payload = {
+        "type": "error",
+        "error": {
+            "message": message,
+            "type": error_type,
+        },
+    }
+    if detail:
+        payload["error"]["detail"] = detail
+    await _ensure_stream_prepared(response, request)
+    await response.write(f"data: {json.dumps(payload)}\n\n".encode())
+    await response.write(b"data: [DONE]\n\n")
+    return response
+
+
+def _is_retriable_upstream_error(exc: Exception) -> bool:
+    """Return whether an upstream curl/network error is worth one reconnect attempt."""
+    code = getattr(exc, "code", None)
+    if isinstance(exc, RequestException) and code in _RETRIABLE_UPSTREAM_ERROR_CODES:
+        return True
+
+    lowered = str(exc).lower()
+    return "connection reset by peer" in lowered or "recv failure" in lowered
+
+
+def _should_retry_upstream_error(exc: Exception, attempt: int, sent_to_client: bool) -> bool:
+    """Retry only before any downstream bytes are sent."""
+    return (
+        not sent_to_client
+        and attempt < _MAX_UPSTREAM_ATTEMPTS
+        and _is_retriable_upstream_error(exc)
+    )
 
 
 async def _read_upstream_text(upstream: Any) -> str:
@@ -423,14 +512,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse | 
 
     # Forward to ChatGPT backend
     translator = ResponseStreamTranslator(model)
-    response: web.StreamResponse | None = None
-    if client_stream:
-        response = web.StreamResponse()
-        response.content_type = "text/event-stream"
-        response.headers["Cache-Control"] = "no-cache"
-        response.headers["Connection"] = "keep-alive"
-        response.headers["X-Accel-Buffering"] = "no"
-        await response.prepare(request)
+    response = _make_stream_response() if client_stream else None
 
     tools_count = len(responses_body.get("tools", []))
     log.info(
@@ -442,124 +524,135 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse | 
     )
     log.debug("Upstream request body: %s", json.dumps(responses_body)[:5000])
 
-    try:
-        session: AsyncSession = request.app["upstream_session"]
-        upstream = await session.post(
-            RESPONSES_ENDPOINT,
-            json=responses_body,
-            headers=headers,
-            stream=True,
-            timeout=120,
-        )
-
-        if upstream.status_code != 200:
-            error_text = await _read_upstream_text(upstream)
-            log.error("Upstream error %d: %s", upstream.status_code, error_text[:1000])
-            if client_stream and response is not None:
-                error_chunk = json.dumps(
-                    {
-                        "error": {
-                            "message": f"ChatGPT API error: {upstream.status_code}",
-                            "type": "upstream_error",
-                            "detail": error_text[:500],
-                        }
-                    }
-                )
-                await response.write(f"data: {error_chunk}\n\n".encode())
-                await response.write(b"data: [DONE]\n\n")
-                return response
-            return web.json_response(
-                {
-                    "error": {
-                        "message": f"ChatGPT API error: {upstream.status_code}",
-                        "type": "upstream_error",
-                        "detail": error_text[:500],
-                    }
-                },
-                status=upstream.status_code,
+    session: AsyncSession = request.app["upstream_session"]
+    for attempt in range(1, _MAX_UPSTREAM_ATTEMPTS + 1):
+        sent_to_client = bool(response is not None and response.prepared)
+        try:
+            upstream = await session.post(
+                RESPONSES_ENDPOINT,
+                json=responses_body,
+                headers=headers,
+                stream=True,
+                timeout=_UPSTREAM_TIMEOUT_SECONDS,
             )
 
-        if client_stream and response is not None:
-            # Process SSE stream from upstream
+            if upstream.status_code != 200:
+                error_text = await _read_upstream_text(upstream)
+                log.error("Upstream error %d: %s", upstream.status_code, error_text[:1000])
+                return web.json_response(
+                    _build_error_payload(
+                        f"ChatGPT API error: {upstream.status_code}",
+                        "upstream_error",
+                        error_text[:500],
+                    ),
+                    status=upstream.status_code,
+                )
+
+            if client_stream and response is not None:
+                async for line_bytes in upstream.aiter_lines():
+                    line = line_bytes.decode() if isinstance(line_bytes, bytes) else line_bytes
+                    line = line.strip()
+                    if not line or not line.startswith("data: "):
+                        continue
+
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        await _ensure_stream_prepared(response, request)
+                        await response.write(b"data: [DONE]\n\n")
+                        return response
+
+                    try:
+                        event_data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        log.warning("Unparseable SSE data: %s", data_str[:200])
+                        continue
+
+                    event_type = event_data.get("type", "")
+                    sse_lines = translator.translate_event(event_type, event_data)
+                    for sse_line in sse_lines:
+                        await _ensure_stream_prepared(response, request)
+                        await response.write(sse_line.encode())
+                        sent_to_client = True
+                        if _parse_sse_data_line(sse_line) == "[DONE]":
+                            return response
+
+                await _ensure_stream_prepared(response, request)
+                await response.write(b"data: [DONE]\n\n")
+                return response
+
+            translated_chunks: list[dict[str, Any]] = []
             async for line_bytes in upstream.aiter_lines():
                 line = line_bytes.decode() if isinstance(line_bytes, bytes) else line_bytes
                 line = line.strip()
-                if not line:
+                if not line or not line.startswith("data: "):
                     continue
-                if line.startswith("data: "):
-                    data_str = line[6:]
-                    if data_str == "[DONE]":
-                        await response.write(b"data: [DONE]\n\n")
-                        return response
-                    try:
-                        event_data = json.loads(data_str)
-                        event_type = event_data.get("type", "")
-                        sse_lines = translator.translate_event(event_type, event_data)
-                        for sse_line in sse_lines:
-                            await response.write(sse_line.encode())
-                    except json.JSONDecodeError:
-                        log.warning("Unparseable SSE data: %s", data_str[:200])
-            return response
 
-        translated_chunks: list[dict[str, Any]] = []
-        async for line_bytes in upstream.aiter_lines():
-            line = line_bytes.decode() if isinstance(line_bytes, bytes) else line_bytes
-            line = line.strip()
-            if not line:
-                continue
-            if not line.startswith("data: "):
-                continue
-
-            data_str = line[6:]
-            if data_str == "[DONE]":
-                break
-
-            try:
-                event_data = json.loads(data_str)
-            except json.JSONDecodeError:
-                log.warning("Unparseable upstream SSE data: %s", data_str[:200])
-                continue
-
-            event_type = event_data.get("type", "")
-            sse_lines = translator.translate_event(event_type, event_data)
-            for sse_line in sse_lines:
-                translated_payload = _parse_sse_data_line(sse_line)
-                if translated_payload is None:
-                    continue
-                if translated_payload == "[DONE]":
+                data_str = line[6:]
+                if data_str == "[DONE]":
                     break
 
                 try:
-                    translated_chunk = json.loads(translated_payload)
+                    event_data = json.loads(data_str)
                 except json.JSONDecodeError:
+                    log.warning("Unparseable upstream SSE data: %s", data_str[:200])
                     continue
 
-                if not isinstance(translated_chunk, dict):
-                    continue
-                if "error" in translated_chunk:
-                    return web.json_response({"error": translated_chunk["error"]}, status=502)
-                translated_chunks.append(translated_chunk)
+                event_type = event_data.get("type", "")
+                sse_lines = translator.translate_event(event_type, event_data)
+                for sse_line in sse_lines:
+                    translated_payload = _parse_sse_data_line(sse_line)
+                    if translated_payload is None:
+                        continue
+                    if translated_payload == "[DONE]":
+                        break
 
-        completion = _aggregate_nonstream_chat_completion(translated_chunks)
-        if completion is not None:
-            return web.json_response(completion)
+                    try:
+                        translated_chunk = json.loads(translated_payload)
+                    except json.JSONDecodeError:
+                        continue
 
-        return web.json_response(
-            {"error": {"message": "Missing translated completion data", "type": "upstream_error"}},
-            status=502,
-        )
+                    if not isinstance(translated_chunk, dict):
+                        continue
+                    if "error" in translated_chunk:
+                        return web.json_response({"error": translated_chunk["error"]}, status=502)
+                    translated_chunks.append(translated_chunk)
 
-    except Exception as e:
-        log.error("Connection error: %s", e)
-        if client_stream and response is not None:
-            error_chunk = json.dumps({"error": {"message": str(e), "type": "connection_error"}})
-            await response.write(f"data: {error_chunk}\n\n".encode())
-            await response.write(b"data: [DONE]\n\n")
-            return response
-        return web.json_response(
-            {"error": {"message": str(e), "type": "connection_error"}},
-            status=502,
-        )
+            completion = _aggregate_nonstream_chat_completion(translated_chunks)
+            if completion is not None:
+                return web.json_response(completion)
+
+            return web.json_response(
+                _build_error_payload("Missing translated completion data", "upstream_error"),
+                status=502,
+            )
+
+        except Exception as e:
+            if _should_retry_upstream_error(e, attempt, sent_to_client):
+                log.warning(
+                    "Retrying upstream chat completion after transient error (%d/%d): %s",
+                    attempt,
+                    _MAX_UPSTREAM_ATTEMPTS,
+                    e,
+                )
+                continue
+
+            log.error("Connection error: %s", e)
+            if client_stream and response is not None and response.prepared:
+                return await _write_chat_stream_error(
+                    request,
+                    response,
+                    str(e),
+                    "connection_error",
+                )
+            return web.json_response(
+                _build_error_payload(str(e), "connection_error"),
+                status=502,
+            )
+
+    return web.json_response(
+        _build_error_payload("Failed to connect to upstream", "connection_error"),
+        status=502,
+    )
 
 
 async def handle_responses(request: web.Request) -> web.StreamResponse | web.Response:
@@ -588,74 +681,94 @@ async def handle_responses(request: web.Request) -> web.StreamResponse | web.Res
     )
     log.debug("Upstream /responses request body: %s", json.dumps(body)[:5000])
 
-    try:
-        session: AsyncSession = request.app["upstream_session"]
-        upstream = await session.post(
-            RESPONSES_ENDPOINT,
-            json=body,
-            headers=headers,
-            stream=True,
-            timeout=120,
-        )
+    session: AsyncSession = request.app["upstream_session"]
+    response = _make_stream_response() if client_stream else None
+    for attempt in range(1, _MAX_UPSTREAM_ATTEMPTS + 1):
+        sent_to_client = bool(response is not None and response.prepared)
+        try:
+            upstream = await session.post(
+                RESPONSES_ENDPOINT,
+                json=body,
+                headers=headers,
+                stream=True,
+                timeout=_UPSTREAM_TIMEOUT_SECONDS,
+            )
 
-        if upstream.status_code != 200:
-            error_text = await _read_upstream_text(upstream)
-            log.error("Upstream /responses error %d: %s", upstream.status_code, error_text[:1000])
-            try:
-                return web.json_response(json.loads(error_text), status=upstream.status_code)
-            except json.JSONDecodeError:
-                return web.Response(text=error_text, status=upstream.status_code)
+            if upstream.status_code != 200:
+                error_text = await _read_upstream_text(upstream)
+                log.error("Upstream /responses error %d: %s", upstream.status_code, error_text[:1000])
+                try:
+                    return web.json_response(json.loads(error_text), status=upstream.status_code)
+                except json.JSONDecodeError:
+                    return web.Response(text=error_text, status=upstream.status_code)
 
-        if client_stream:
-            response = web.StreamResponse()
-            response.content_type = "text/event-stream"
-            response.headers["Cache-Control"] = "no-cache"
-            response.headers["Connection"] = "keep-alive"
-            response.headers["X-Accel-Buffering"] = "no"
-            await response.prepare(request)
+            if client_stream and response is not None:
+                async for chunk in upstream.aiter_content():
+                    await _ensure_stream_prepared(response, request)
+                    await response.write(chunk if isinstance(chunk, bytes) else chunk.encode())
+                    sent_to_client = True
+                await _ensure_stream_prepared(response, request)
+                return response
 
-            async for chunk in upstream.aiter_content():
-                await response.write(chunk if isinstance(chunk, bytes) else chunk.encode())
-            return response
+            completed_response: dict[str, Any] | None = None
+            async for line_bytes in upstream.aiter_lines():
+                line = line_bytes.decode() if isinstance(line_bytes, bytes) else line_bytes
+                line = line.strip()
+                if not line or not line.startswith("data: "):
+                    continue
 
-        completed_response: dict[str, Any] | None = None
-        async for line_bytes in upstream.aiter_lines():
-            line = line_bytes.decode() if isinstance(line_bytes, bytes) else line_bytes
-            line = line.strip()
-            if not line or not line.startswith("data: "):
+                data_str = line[6:]
+                if data_str == "[DONE]":
+                    break
+
+                try:
+                    event_data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                event_type = event_data.get("type", "")
+                if event_type == "response.completed":
+                    response_obj = event_data.get("response")
+                    if isinstance(response_obj, dict):
+                        completed_response = response_obj
+                elif event_type in {"error", "response.failed"}:
+                    return web.json_response(event_data, status=502)
+
+            if completed_response is not None:
+                return web.json_response(completed_response, status=200)
+
+            return web.json_response(
+                _build_error_payload("Missing response.completed event", "upstream_error"),
+                status=502,
+            )
+
+        except Exception as e:
+            if _should_retry_upstream_error(e, attempt, sent_to_client):
+                log.warning(
+                    "Retrying upstream /responses request after transient error (%d/%d): %s",
+                    attempt,
+                    _MAX_UPSTREAM_ATTEMPTS,
+                    e,
+                )
                 continue
 
-            data_str = line[6:]
-            if data_str == "[DONE]":
-                break
+            log.error("Connection error on /responses: %s", e)
+            if client_stream and response is not None and response.prepared:
+                return await _write_responses_stream_error(
+                    request,
+                    response,
+                    str(e),
+                    "connection_error",
+                )
+            return web.json_response(
+                _build_error_payload(str(e), "connection_error"),
+                status=502,
+            )
 
-            try:
-                event_data = json.loads(data_str)
-            except json.JSONDecodeError:
-                continue
-
-            event_type = event_data.get("type", "")
-            if event_type == "response.completed":
-                response_obj = event_data.get("response")
-                if isinstance(response_obj, dict):
-                    completed_response = response_obj
-            elif event_type in {"error", "response.failed"}:
-                return web.json_response(event_data, status=502)
-
-        if completed_response is not None:
-            return web.json_response(completed_response, status=200)
-
-        return web.json_response(
-            {"error": {"message": "Missing response.completed event", "type": "upstream_error"}},
-            status=502,
-        )
-
-    except Exception as e:
-        log.error("Connection error on /responses: %s", e)
-        return web.json_response(
-            {"error": {"message": str(e), "type": "connection_error"}},
-            status=502,
-        )
+    return web.json_response(
+        _build_error_payload("Failed to connect to upstream", "connection_error"),
+        status=502,
+    )
 
 
 async def _create_upstream_session(app: web.Application) -> None:
@@ -663,6 +776,8 @@ async def _create_upstream_session(app: web.Application) -> None:
     app["upstream_session"] = AsyncSession(
         impersonate="chrome",
         proxies={"https": proxy} if proxy else None,
+        http_version="v1",
+        curl_options={CurlOpt.TCP_KEEPALIVE: 1},
     )
 
 
