@@ -203,7 +203,13 @@ class TestChatToResponses:
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "What's in this image?"},
-                        {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://example.com/img.png",
+                                "detail": "high",
+                            },
+                        },
                     ],
                 }
             ],
@@ -212,7 +218,11 @@ class TestChatToResponses:
         content = result["input"][0]["content"]
         assert len(content) == 2
         assert content[0] == {"type": "input_text", "text": "What's in this image?"}
-        assert content[1] == {"type": "input_image", "url": "https://example.com/img.png"}
+        assert content[1] == {
+            "type": "input_image",
+            "image_url": "https://example.com/img.png",
+            "detail": "high",
+        }
 
 
 class TestResponseStreamTranslator:

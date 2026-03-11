@@ -54,6 +54,15 @@ _UNSUPPORTED_RESPONSES_PARAMS = {
 _UPSTREAM_TIMEOUT_SECONDS = 120
 _MAX_UPSTREAM_ATTEMPTS = 2
 _RETRIABLE_UPSTREAM_ERROR_CODES = {18, 35, 52, 55, 56, 92}
+_RETRIABLE_UPSTREAM_EVENT_MARKERS = (
+    "serviceunavailable",
+    "service_unavailable",
+    "api_connection_error",
+    "connection error",
+    "temporarily unavailable",
+    "please retry",
+    "an error occurred while processing your request",
+)
 
 
 def _normalize_tool_strict(value: Any) -> bool:
@@ -70,10 +79,30 @@ def _normalize_input_content(content: Any) -> Any:
 
     normalized: list[Any] = []
     for part in content:
-        if isinstance(part, dict) and part.get("type") == "text":
-            normalized.append({"type": "input_text", "text": part.get("text", "")})
-        else:
+        if not isinstance(part, dict):
             normalized.append(part)
+            continue
+
+        if part.get("type") == "text":
+            normalized.append({"type": "input_text", "text": part.get("text", "")})
+            continue
+
+        if part.get("type") == "image_url":
+            image_url = part.get("image_url")
+            if isinstance(image_url, dict):
+                url = image_url.get("url", "")
+                detail = image_url.get("detail")
+            else:
+                url = image_url or ""
+                detail = None
+
+            input_image = {"type": "input_image", "image_url": url}
+            if detail:
+                input_image["detail"] = detail
+            normalized.append(input_image)
+            continue
+
+        normalized.append(part)
     return normalized
 
 
@@ -277,6 +306,15 @@ def _should_retry_upstream_error(exc: Exception, attempt: int, sent_to_client: b
         and attempt < _MAX_UPSTREAM_ATTEMPTS
         and _is_retriable_upstream_error(exc)
     )
+
+
+def _is_retriable_upstream_event(event_type: str, event_data: dict[str, Any]) -> bool:
+    """Return whether an upstream SSE error event looks transient."""
+    if event_type not in {"error", "response.failed"}:
+        return False
+
+    lowered = json.dumps(event_data, ensure_ascii=False).lower()
+    return any(marker in lowered for marker in _RETRIABLE_UPSTREAM_EVENT_MARKERS)
 
 
 async def _read_upstream_text(upstream: Any) -> str:
@@ -549,6 +587,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse | 
                 )
 
             if client_stream and response is not None:
+                retry_stream = False
                 async for line_bytes in upstream.aiter_lines():
                     line = line_bytes.decode() if isinstance(line_bytes, bytes) else line_bytes
                     line = line.strip()
@@ -568,6 +607,22 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse | 
                         continue
 
                     event_type = event_data.get("type", "")
+                    if event_type in {"error", "response.failed"}:
+                        retriable_event = (
+                            not sent_to_client
+                            and attempt < _MAX_UPSTREAM_ATTEMPTS
+                            and _is_retriable_upstream_event(event_type, event_data)
+                        )
+                        log_method = log.warning if retriable_event else log.error
+                        log_method(
+                            "Upstream streaming event %s: %s",
+                            event_type,
+                            json.dumps(event_data)[:1000],
+                        )
+                        if retriable_event:
+                            retry_stream = True
+                            break
+
                     sse_lines = translator.translate_event(event_type, event_data)
                     for sse_line in sse_lines:
                         await _ensure_stream_prepared(response, request)
@@ -576,11 +631,20 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse | 
                         if _parse_sse_data_line(sse_line) == "[DONE]":
                             return response
 
+                if retry_stream:
+                    log.warning(
+                        "Retrying upstream chat completion after transient stream event (%d/%d)",
+                        attempt,
+                        _MAX_UPSTREAM_ATTEMPTS,
+                    )
+                    continue
+
                 await _ensure_stream_prepared(response, request)
                 await response.write(b"data: [DONE]\n\n")
                 return response
 
             translated_chunks: list[dict[str, Any]] = []
+            retry_nonstream = False
             async for line_bytes in upstream.aiter_lines():
                 line = line_bytes.decode() if isinstance(line_bytes, bytes) else line_bytes
                 line = line.strip()
@@ -598,6 +662,22 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse | 
                     continue
 
                 event_type = event_data.get("type", "")
+                if event_type in {"error", "response.failed"}:
+                    retriable_event = (
+                        not translated_chunks
+                        and attempt < _MAX_UPSTREAM_ATTEMPTS
+                        and _is_retriable_upstream_event(event_type, event_data)
+                    )
+                    log_method = log.warning if retriable_event else log.error
+                    log_method(
+                        "Upstream non-stream event %s: %s",
+                        event_type,
+                        json.dumps(event_data)[:1000],
+                    )
+                    if retriable_event:
+                        retry_nonstream = True
+                        break
+
                 sse_lines = translator.translate_event(event_type, event_data)
                 for sse_line in sse_lines:
                     translated_payload = _parse_sse_data_line(sse_line)
@@ -616,6 +696,14 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse | 
                     if "error" in translated_chunk:
                         return web.json_response({"error": translated_chunk["error"]}, status=502)
                     translated_chunks.append(translated_chunk)
+
+            if retry_nonstream:
+                log.warning(
+                    "Retrying upstream non-stream chat completion after transient stream event (%d/%d)",
+                    attempt,
+                    _MAX_UPSTREAM_ATTEMPTS,
+                )
+                continue
 
             completion = _aggregate_nonstream_chat_completion(translated_chunks)
             if completion is not None:

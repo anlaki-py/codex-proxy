@@ -159,8 +159,18 @@ def _to_input_content(content: Any) -> list[dict[str, Any]]:
                 if part.get("type") == "text":
                     result.append({"type": "input_text", "text": part.get("text", "")})
                 elif part.get("type") == "image_url":
-                    url = part.get("image_url", {}).get("url", "")
-                    result.append({"type": "input_image", "url": url})
+                    image_url = part.get("image_url")
+                    if isinstance(image_url, dict):
+                        url = image_url.get("url", "")
+                        detail = image_url.get("detail")
+                    else:
+                        url = image_url or ""
+                        detail = None
+
+                    input_image = {"type": "input_image", "image_url": url}
+                    if detail:
+                        input_image["detail"] = detail
+                    result.append(input_image)
         return result
     return [{"type": "input_text", "text": str(content)}]
 

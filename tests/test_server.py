@@ -183,6 +183,44 @@ def test_normalize_responses_body_normalizes_litellm_input_and_strict_null():
     assert body["parallel_tool_calls"] is False
 
 
+def test_normalize_responses_body_converts_openai_image_parts():
+    body, _ = _normalize_responses_body(
+        {
+            "model": "gpt-5.3-codex",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://example.com/cat.png",
+                                "detail": "low",
+                            },
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert body["input"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "describe"},
+                {
+                    "type": "input_image",
+                    "image_url": "https://example.com/cat.png",
+                    "detail": "low",
+                },
+            ],
+        }
+    ]
+
+
 def test_normalize_responses_body_keeps_explicit_parallel_tool_calls():
     body, _ = _normalize_responses_body(
         {
@@ -432,6 +470,53 @@ async def test_handle_chat_completions_retries_before_first_downstream_byte(monk
     assert session.calls == 2
     body = b"".join(response.writes).decode()
     assert '"content": "Hi"' in body
+    assert body.count("data: [DONE]") == 1
+
+
+@pytest.mark.asyncio
+async def test_handle_chat_completions_retries_transient_upstream_error_event(monkeypatch):
+    session = _FakeSession(
+        [
+            _FakeUpstreamLines(
+                [
+                    (
+                        'data: {"type":"error","error":{"type":"service_unavailable",'
+                        '"message":"An error occurred while processing your request. Please retry."}}'
+                    ),
+                ]
+            ),
+            _FakeUpstreamLines(
+                [
+                    'data: {"type":"response.output_item.added","item":{"type":"message","role":"assistant"}}',
+                    'data: {"type":"response.output_text.delta","delta":"Recovered"}',
+                    (
+                        'data: {"type":"response.completed","response":{"status":"completed",'
+                        '"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2,'
+                        '"input_tokens_details":{"cached_tokens":0}}}}'
+                    ),
+                ]
+            ),
+        ]
+    )
+    request = _FakeRequest(
+        {
+            "model": "gpt-5.1",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": True,
+        },
+        {"upstream_session": session},
+    )
+
+    monkeypatch.setattr("codex_proxy.server.ensure_credentials", _fake_credentials)
+    monkeypatch.setattr("codex_proxy.server.web.StreamResponse", _FakeStreamResponse)
+
+    response = await handle_chat_completions(request)
+
+    assert isinstance(response, _FakeStreamResponse)
+    assert session.calls == 2
+    body = b"".join(response.writes).decode()
+    assert '"content": "Recovered"' in body
+    assert '"type": "error"' not in body
     assert body.count("data: [DONE]") == 1
 
 
