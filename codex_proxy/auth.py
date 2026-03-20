@@ -9,6 +9,7 @@ import secrets
 import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from threading import Event, Thread
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -19,7 +20,6 @@ from codex_proxy.config import (
     AUTHORIZE_URL,
     CALLBACK_PORT,
     CLIENT_ID,
-    CONFIG_DIR,
     CREDENTIALS_FILE,
     JWT_CLAIM_PATH,
     REDIRECT_URI,
@@ -66,6 +66,22 @@ def _decode_jwt_payload(token: str) -> dict[str, Any]:
     payload_b64 = parts[1] + "=" * (4 - len(parts[1]) % 4)
     payload_bytes = base64.urlsafe_b64decode(payload_b64)
     return json.loads(payload_bytes)
+
+
+def _extract_optional_claim(token: str | None, *claim_names: str) -> str | None:
+    """Read one string claim from a JWT, ignoring invalid tokens."""
+    if not token:
+        return None
+    try:
+        payload = _decode_jwt_payload(token)
+    except (ValueError, json.JSONDecodeError):
+        return None
+
+    for claim_name in claim_names:
+        value = payload.get(claim_name)
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 def extract_account_id(token: str) -> str:
@@ -184,30 +200,40 @@ async def _refresh_token(refresh_token: str) -> dict[str, Any]:
             return await resp.json()
 
 
-def _build_credentials(token_response: dict[str, Any]) -> dict[str, Any]:
+def _build_credentials(
+    token_response: dict[str, Any], previous: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Build credentials dict from token response."""
     access_token = token_response["access_token"]
+    id_token = token_response.get("id_token")
+    identity_token = id_token if isinstance(id_token, str) else access_token
     account_id = extract_account_id(access_token)
     return {
         "access_token": access_token,
         "refresh_token": token_response.get("refresh_token"),
         "account_id": account_id,
+        "email": _extract_optional_claim(identity_token, "email")
+        or (previous or {}).get("email"),
+        "user_id": _extract_optional_claim(identity_token, "sub", "user_id")
+        or (previous or {}).get("user_id"),
+        "name": _extract_optional_claim(identity_token, "name", "preferred_username")
+        or (previous or {}).get("name"),
         "expires_at": time.time() + token_response.get("expires_in", 3600),
     }
 
 
-def save_credentials(credentials: dict[str, Any]) -> None:
+def save_credentials(credentials: dict[str, Any], path: Path = CREDENTIALS_FILE) -> None:
     """Save credentials to disk."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CREDENTIALS_FILE.write_text(json.dumps(credentials, indent=2))
-    log.info("Credentials saved to %s", CREDENTIALS_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(credentials, indent=2))
+    log.info("Credentials saved to %s", path)
 
 
-def load_credentials() -> dict[str, Any] | None:
+def load_credentials(path: Path = CREDENTIALS_FILE) -> dict[str, Any] | None:
     """Load credentials from disk. Returns None if not found."""
-    if not CREDENTIALS_FILE.exists():
+    if not path.exists():
         return None
-    return json.loads(CREDENTIALS_FILE.read_text())
+    return json.loads(path.read_text())
 
 
 def is_expired(credentials: dict[str, Any], margin: float = 60.0) -> bool:
@@ -248,9 +274,9 @@ async def login() -> dict[str, Any]:
     return credentials
 
 
-async def ensure_credentials() -> dict[str, Any]:
+async def ensure_credentials(path: Path = CREDENTIALS_FILE) -> dict[str, Any]:
     """Load credentials, refreshing if expired. Raises if no credentials."""
-    credentials = load_credentials()
+    credentials = load_credentials(path)
     if credentials is None:
         raise RuntimeError("Not logged in. Run 'codex-proxy login' first.")
 
@@ -260,8 +286,8 @@ async def ensure_credentials() -> dict[str, Any]:
             raise RuntimeError("Token expired and no refresh token. Run 'codex-proxy login'.")
         log.info("Token expired, refreshing...")
         token_response = await _refresh_token(refresh)
-        credentials = _build_credentials(token_response)
-        save_credentials(credentials)
+        credentials = _build_credentials(token_response, previous=credentials)
+        save_credentials(credentials, path)
         log.info("Token refreshed successfully")
 
     return credentials

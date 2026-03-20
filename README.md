@@ -20,8 +20,14 @@ codex-proxy login
 codex-proxy serve                # default: 0.0.0.0:8787
 codex-proxy serve -p 9000        # custom port
 
-# Check token status
-codex-proxy status
+# List saved accounts with usage
+codex-proxy accounts
+
+# Switch active account by account id and show its usage
+codex-proxy switch <account-id>
+
+# Remove one saved account by account id
+codex-proxy accounts --remove <account-id>
 ```
 
 ## Authentication
@@ -42,7 +48,9 @@ The systemd unit sets this to `codex-proxy` by default.
 
 ### Upstream (proxy → ChatGPT)
 
-Upstream authentication is handled automatically via ChatGPT OAuth tokens stored in `~/.codex-proxy/credentials.json`. Run `codex-proxy login` to set up.
+Upstream authentication is handled automatically via ChatGPT OAuth tokens stored in `~/.codex-proxy/credentials.json`. When you save multiple logins, snapshots are also kept under `~/.codex-proxy/accounts/`, and `codex-proxy switch <label|email|account_id>` updates the active `credentials.json`.
+
+Run `codex-proxy login` to add the current account, `codex-proxy accounts` to list all saved accounts with usage and account ids, `codex-proxy switch <account-id>` to change the active account, and `codex-proxy accounts --remove <account-id>` to delete one saved account.
 
 ## Network Access
 

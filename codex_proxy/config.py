@@ -16,10 +16,13 @@ JWT_CLAIM_PATH = "https://api.openai.com/auth"
 # ChatGPT backend API
 CHATGPT_BACKEND_URL = "https://chatgpt.com/backend-api"
 RESPONSES_ENDPOINT = f"{CHATGPT_BACKEND_URL}/codex/responses"
+USAGE_ENDPOINT = f"{CHATGPT_BACKEND_URL}/wham/usage"
 
 # Local storage
 CONFIG_DIR = Path.home() / ".codex-proxy"
 CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
+ACCOUNTS_DIR = CONFIG_DIR / "accounts"
+REGISTRY_FILE = ACCOUNTS_DIR / "registry.json"
 
 # Server defaults
 DEFAULT_PORT = 8787
