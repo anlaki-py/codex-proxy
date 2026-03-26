@@ -6,9 +6,9 @@ from pathlib import Path
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
 TOKEN_URL = "https://auth.openai.com/oauth/token"
+CALLBACK_PORT = 1455
 REDIRECT_URI = "http://localhost:1455/auth/callback"
 SCOPE = "openid profile email offline_access"
-CALLBACK_PORT = 1455
 
 # JWT claim path for account ID extraction
 JWT_CLAIM_PATH = "https://api.openai.com/auth"

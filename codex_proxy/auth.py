@@ -1,6 +1,7 @@
 """OAuth PKCE authentication for OpenAI Codex (via ChatGPT)."""
 
 import base64
+import errno
 import hashlib
 import json
 import logging
@@ -143,14 +144,32 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         pass  # Suppress default request logging
 
 
-def _wait_for_callback(state: str, timeout: float = 120.0) -> str:
-    """Start local server and wait for OAuth callback."""
+class _CallbackHTTPServer(HTTPServer):
+    """HTTP server that can immediately reuse the callback port."""
+
+    allow_reuse_address = True
+
+
+def _start_callback_server(state: str) -> HTTPServer:
+    """Start the localhost callback server on the fixed OAuth port."""
     _CallbackHandler.auth_code = None
     _CallbackHandler.error = None
     _CallbackHandler.expected_state = state
     _CallbackHandler.received = Event()
 
-    server = HTTPServer(("127.0.0.1", CALLBACK_PORT), _CallbackHandler)
+    try:
+        return _CallbackHTTPServer(("127.0.0.1", CALLBACK_PORT), _CallbackHandler)
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            raise RuntimeError(
+                f"OAuth callback port {CALLBACK_PORT} is already in use. "
+                "Close the app using it and try again."
+            ) from exc
+        raise
+
+
+def _wait_for_callback(server: HTTPServer, timeout: float = 120.0) -> str:
+    """Wait for the OAuth callback on an already-started server."""
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
@@ -164,6 +183,7 @@ def _wait_for_callback(state: str, timeout: float = 120.0) -> str:
         return _CallbackHandler.auth_code
     finally:
         server.shutdown()
+        server.server_close()
 
 
 async def _exchange_code(code: str, code_verifier: str) -> dict[str, Any]:
@@ -245,6 +265,7 @@ async def login() -> dict[str, Any]:
     """Run the full OAuth PKCE login flow."""
     code_verifier, code_challenge = _generate_pkce()
     state = secrets.token_urlsafe(32)
+    server = _start_callback_server(state)
 
     params = urlencode(
         {
@@ -263,7 +284,7 @@ async def login() -> dict[str, Any]:
     print(f"Opening browser for login...\n  {auth_url}")
     _open_browser(auth_url)
 
-    code = _wait_for_callback(state)
+    code = _wait_for_callback(server)
     log.info("Received authorization code")
 
     token_response = await _exchange_code(code, code_verifier)

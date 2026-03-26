@@ -37,7 +37,10 @@ def login() -> None:
     """Authenticate with ChatGPT via OAuth PKCE."""
     from codex_proxy.auth import login as do_login
 
-    credentials = asyncio.run(do_login())
+    try:
+        credentials = asyncio.run(do_login())
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
     record = upsert_account(credentials, activate=True)
     click.echo(f"Saved account: {record['label']}")
 
