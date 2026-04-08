@@ -31,6 +31,12 @@ _UNSUPPORTED_PARAMS = {
     "service_tier",
 }
 
+_CLAUDE_MODEL_ALIASES = {
+    "claude-opus": "gpt-5.4",
+    "claude-sonnet": "gpt-5.3-codex",
+    "claude-haiku": "gpt-5.4-mini",
+}
+
 
 def chat_to_responses(request: dict[str, Any]) -> dict[str, Any]:
     """Convert a Chat Completions request to a Responses API request body.
@@ -103,9 +109,7 @@ def chat_to_responses(request: dict[str, Any]) -> dict[str, Any]:
             )
 
     # Strip provider prefix (e.g. "vllm/gpt-5.1" → "gpt-5.1")
-    model = request.get("model", "gpt-5.1")
-    if "/" in model:
-        model = model.split("/", 1)[1]
+    model = _normalize_model_name(request.get("model"), default="gpt-5.1")
 
     instructions = "\n\n".join(system_parts) if system_parts else "You are a helpful assistant."
 
@@ -142,7 +146,9 @@ def _extract_text(content: Any) -> str:
     if isinstance(content, list):
         parts = []
         for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") in {"text", "output_text"}:
                 parts.append(part.get("text", ""))
         return "\n".join(parts)
     return str(content) if content else ""
@@ -156,7 +162,7 @@ def _to_input_content(content: Any) -> list[dict[str, Any]]:
         result = []
         for part in content:
             if isinstance(part, dict):
-                if part.get("type") == "text":
+                if part.get("type") in {"text", "output_text"}:
                     result.append({"type": "input_text", "text": part.get("text", "")})
                 elif part.get("type") == "image_url":
                     image_url = part.get("image_url")
@@ -167,12 +173,109 @@ def _to_input_content(content: Any) -> list[dict[str, Any]]:
                         url = image_url or ""
                         detail = None
 
-                    input_image = {"type": "input_image", "image_url": url}
+                    input_image: dict[str, Any] = {"type": "input_image", "image_url": url}
                     if detail:
                         input_image["detail"] = detail
                     result.append(input_image)
+                elif part.get("type") == "image":
+                    input_image = _anthropic_image_to_input_image(part)
+                    if input_image is not None:
+                        result.append(input_image)
         return result
     return [{"type": "input_text", "text": str(content)}]
+
+
+def anthropic_messages_to_responses(request: dict[str, Any]) -> dict[str, Any]:
+    """Convert Anthropic Messages payloads into ChatGPT Responses payloads."""
+    system = request.get("system")
+    messages = request.get("messages", [])
+    model = _normalize_model_name(request.get("model"), default="gpt-5.4")
+    input_items: list[dict[str, Any]] = []
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+
+        role = msg.get("role", "")
+        content = msg.get("content", [])
+
+        if role == "user":
+            text_or_media: list[dict[str, Any]] = []
+            for part in _as_content_blocks(content):
+                part_type = part.get("type")
+                if part_type == "tool_result":
+                    call_id = _normalize_tool_call_id(part.get("tool_use_id", ""))
+                    input_items.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": _extract_tool_result_output(part.get("content")),
+                        }
+                    )
+                    continue
+
+                normalized_part = _anthropic_part_to_input_content(part)
+                if normalized_part is not None:
+                    text_or_media.append(normalized_part)
+
+            if text_or_media:
+                input_items.append({"role": "user", "content": text_or_media})
+
+        elif role == "assistant":
+            assistant_text: list[dict[str, Any]] = []
+            for part in _as_content_blocks(content):
+                part_type = part.get("type")
+                if part_type == "tool_use":
+                    call_id = _normalize_tool_call_id(part.get("id", ""))
+                    input_items.append(
+                        {
+                            "type": "function_call",
+                            "id": call_id,
+                            "call_id": call_id,
+                            "name": part.get("name", ""),
+                            "arguments": json.dumps(part.get("input", {}), ensure_ascii=False),
+                        }
+                    )
+                    continue
+                if part_type == "thinking":
+                    text = part.get("thinking", "")
+                    if text:
+                        assistant_text.append({"type": "output_text", "text": text})
+                    continue
+
+                normalized_part = _anthropic_part_to_assistant_content(part)
+                if normalized_part is not None:
+                    assistant_text.append(normalized_part)
+
+            if assistant_text:
+                input_items.append(
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": assistant_text,
+                    }
+                )
+
+    body: dict[str, Any] = {
+        "model": model,
+        "stream": bool(request.get("stream", True)),
+        "store": False,
+        "instructions": _extract_anthropic_system_text(system) or "You are a helpful assistant.",
+        "input": input_items,
+        "include": ["reasoning.encrypted_content"],
+    }
+
+    tools = request.get("tools")
+    if isinstance(tools, list) and tools:
+        body["tools"] = _convert_anthropic_tools(tools)
+        body["tool_choice"] = _convert_anthropic_tool_choice(request.get("tool_choice"))
+        body["parallel_tool_calls"] = False
+
+    thinking = _convert_anthropic_thinking(request.get("thinking"))
+    if thinking:
+        body["reasoning"] = thinking
+
+    return body
 
 
 def _normalize_tool_call_id(call_id: str) -> str:
@@ -180,6 +283,155 @@ def _normalize_tool_call_id(call_id: str) -> str:
     if not call_id.startswith("fc_"):
         call_id = f"fc_{call_id}"
     return call_id[:64]
+
+
+def _tool_call_id_to_anthropic(call_id: str) -> str:
+    """Convert an upstream function call ID into an Anthropic-style tool_use ID."""
+    normalized = _normalize_tool_call_id(call_id)
+    suffix = normalized[3:] if normalized.startswith("fc_") else normalized
+    suffix = suffix.replace("-", "").replace("_", "")
+    return f"toolu_{suffix[:40] or uuid.uuid4().hex[:12]}"
+
+
+def _normalize_model_name(model: Any, default: str) -> str:
+    if not isinstance(model, str) or not model:
+        return default
+    if "/" in model:
+        model = model.split("/", 1)[1]
+    lowered = model.lower()
+    for prefix, target in _CLAUDE_MODEL_ALIASES.items():
+        if lowered.startswith(prefix):
+            return target
+    return model
+
+
+def _normalize_tool_strict(value: Any) -> bool:
+    return value if isinstance(value, bool) else False
+
+
+def _as_content_blocks(content: Any) -> list[dict[str, Any]]:
+    if isinstance(content, list):
+        return [part for part in content if isinstance(part, dict)]
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    return []
+
+
+def _extract_anthropic_system_text(system: Any) -> str:
+    if isinstance(system, str):
+        return system
+    if isinstance(system, list):
+        parts: list[str] = []
+        for block in system:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text", "")
+                if text:
+                    parts.append(text)
+        return "\n\n".join(parts)
+    return ""
+
+
+def _anthropic_part_to_input_content(part: dict[str, Any]) -> dict[str, Any] | None:
+    part_type = part.get("type")
+    if part_type == "text":
+        return {"type": "input_text", "text": part.get("text", "")}
+    if part_type == "image":
+        return _anthropic_image_to_input_image(part)
+    return None
+
+
+def _anthropic_part_to_assistant_content(part: dict[str, Any]) -> dict[str, Any] | None:
+    if part.get("type") == "text":
+        return {"type": "output_text", "text": part.get("text", "")}
+    return None
+
+
+def _anthropic_image_to_input_image(part: dict[str, Any]) -> dict[str, Any] | None:
+    source = part.get("source")
+    if not isinstance(source, dict):
+        return None
+
+    if source.get("type") == "base64":
+        media_type = source.get("media_type", "image/png")
+        data = source.get("data", "")
+        return {
+            "type": "input_image",
+            "image_url": f"data:{media_type};base64,{data}",
+        }
+
+    if source.get("type") == "url":
+        url = source.get("url", "")
+        if isinstance(url, str) and url:
+            return {"type": "input_image", "image_url": url}
+
+    return None
+
+
+def _extract_tool_result_output(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return json.dumps(content, ensure_ascii=False) if content is not None else ""
+
+
+def _convert_anthropic_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        result.append(
+            {
+                "type": "function",
+                "name": tool.get("name", ""),
+                "description": tool.get("description", ""),
+                "parameters": tool.get("input_schema", {}),
+                "strict": _normalize_tool_strict(tool.get("strict")),
+            }
+        )
+    return result
+
+
+def _convert_anthropic_tool_choice(tool_choice: Any) -> Any:
+    if not isinstance(tool_choice, dict):
+        return "auto"
+
+    choice_type = tool_choice.get("type")
+    if choice_type == "tool":
+        return {"type": "function", "name": tool_choice.get("name", "")}
+    if choice_type == "any":
+        return "required"
+    if choice_type == "none":
+        return "none"
+    return "auto"
+
+
+def _convert_anthropic_thinking(thinking: Any) -> dict[str, str] | None:
+    if not thinking:
+        return None
+
+    if isinstance(thinking, dict):
+        thinking_type = thinking.get("type")
+        if thinking_type == "adaptive":
+            return {"effort": "high"}
+        if thinking_type == "enabled":
+            budget = thinking.get("budget_tokens")
+            if not isinstance(budget, int):
+                budget = thinking.get("budgetTokens")
+            if isinstance(budget, int):
+                if budget >= 16000:
+                    return {"effort": "high"}
+                if budget <= 2048:
+                    return {"effort": "low"}
+            return {"effort": "medium"}
+        if thinking_type == "disabled":
+            return None
+
+    return {"effort": "medium"}
 
 
 def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -356,4 +608,259 @@ _EVENT_HANDLERS: dict[str, Any] = {
     "response.completed": ResponseStreamTranslator._on_completed,
     "error": ResponseStreamTranslator._on_error,
     "response.failed": ResponseStreamTranslator._on_error,
+}
+
+
+def _format_anthropic_sse(event: str, payload: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+class AnthropicStreamTranslator:
+    """Translate Responses SSE events into Anthropic Messages SSE events."""
+
+    def __init__(self, model: str) -> None:
+        self.model = model
+        self.message_id = f"msg_{uuid.uuid4().hex[:24]}"
+        self.started = False
+        self.closed = False
+        self.current_block_index: int | None = None
+        self.current_block_type: str | None = None
+        self.current_item_id: str | None = None
+        self.current_stop_reason = "end_turn"
+        self.usage = {"input_tokens": 0, "output_tokens": 0}
+        self.content: list[dict[str, Any]] = []
+        self._tool_call_by_item_id: dict[str, str] = {}
+        self._tool_input_buffers: dict[str, str] = {}
+
+    def translate_event(self, event_type: str, event_data: dict[str, Any]) -> list[str]:
+        handler = _ANTHROPIC_EVENT_HANDLERS.get(event_type)
+        if handler:
+            return handler(self, event_data)
+        return []
+
+    def build_response(self) -> dict[str, Any]:
+        return {
+            "id": self.message_id,
+            "type": "message",
+            "role": "assistant",
+            "model": self.model,
+            "content": self.content or [{"type": "text", "text": ""}],
+            "stop_reason": self.current_stop_reason,
+            "stop_sequence": None,
+            "usage": dict(self.usage),
+        }
+
+    def _ensure_started(self) -> list[str]:
+        if self.started:
+            return []
+        self.started = True
+        return [
+            _format_anthropic_sse(
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": self.message_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": self.model,
+                        "content": [],
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": 0, "output_tokens": 0},
+                    },
+                },
+            )
+        ]
+
+    def _close_current_block(self) -> list[str]:
+        if self.current_block_index is None:
+            return []
+        index = self.current_block_index
+        self.current_block_index = None
+        self.current_block_type = None
+        self.current_item_id = None
+        return [
+            _format_anthropic_sse(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": index},
+            )
+        ]
+
+    def _start_text_block(self) -> list[str]:
+        if self.current_block_type == "text":
+            return []
+        lines = self._ensure_started()
+        lines.extend(self._close_current_block())
+        self.current_block_index = len(self.content)
+        self.current_block_type = "text"
+        self.current_item_id = None
+        self.content.append({"type": "text", "text": ""})
+        lines.append(
+            _format_anthropic_sse(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": self.current_block_index,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            )
+        )
+        return lines
+
+    def _start_tool_block(self, item: dict[str, Any]) -> list[str]:
+        lines = self._ensure_started()
+        lines.extend(self._close_current_block())
+        item_id = item.get("id", "")
+        tool_id = _tool_call_id_to_anthropic(item.get("call_id", item_id))
+        self._tool_call_by_item_id[item_id] = tool_id
+        self._tool_input_buffers[item_id] = ""
+        self.current_stop_reason = "tool_use"
+        self.current_block_index = len(self.content)
+        self.current_block_type = "tool_use"
+        self.current_item_id = item_id
+        self.content.append(
+            {
+                "type": "tool_use",
+                "id": tool_id,
+                "name": item.get("name", ""),
+                "input": {},
+            }
+        )
+        lines.append(
+            _format_anthropic_sse(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": self.current_block_index,
+                    "content_block": dict(self.content[self.current_block_index]),
+                },
+            )
+        )
+        return lines
+
+    def _on_output_item_added(self, data: dict[str, Any]) -> list[str]:
+        item = data.get("item", {})
+        item_type = item.get("type")
+        if item_type == "message":
+            return self._start_text_block()
+        if item_type == "function_call":
+            return self._start_tool_block(item)
+        return []
+
+    def _on_text_delta(self, data: dict[str, Any]) -> list[str]:
+        delta_text = data.get("delta", "")
+        if not delta_text:
+            return []
+        lines = self._start_text_block()
+        assert self.current_block_index is not None
+        self.content[self.current_block_index]["text"] += delta_text
+        lines.append(
+            _format_anthropic_sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": self.current_block_index,
+                    "delta": {"type": "text_delta", "text": delta_text},
+                },
+            )
+        )
+        return lines
+
+    def _on_function_args_delta(self, data: dict[str, Any]) -> list[str]:
+        item_id = data.get("item_id", "")
+        delta_text = data.get("delta", "")
+        if not item_id or not delta_text:
+            return []
+        index = self.current_block_index
+        if item_id != self.current_item_id:
+            index = next(
+                (
+                    idx
+                    for idx, block in enumerate(self.content)
+                    if block.get("type") == "tool_use"
+                    and block.get("id") == self._tool_call_by_item_id.get(item_id)
+                ),
+                None,
+            )
+        if index is None:
+            return []
+        self._tool_input_buffers[item_id] = self._tool_input_buffers.get(item_id, "") + delta_text
+        try:
+            self.content[index]["input"] = json.loads(self._tool_input_buffers[item_id])
+        except json.JSONDecodeError:
+            pass
+        return [
+            _format_anthropic_sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "input_json_delta", "partial_json": delta_text},
+                },
+            )
+        ]
+
+    def _on_completed(self, data: dict[str, Any]) -> list[str]:
+        response = data.get("response", {})
+        usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+        incomplete = (
+            response.get("incomplete_details")
+            if isinstance(response.get("incomplete_details"), dict)
+            else {}
+        )
+        reason = incomplete.get("reason")
+        if reason in {"max_tokens", "max_output_tokens"} or response.get("status") == "incomplete":
+            self.current_stop_reason = "max_tokens"
+        elif reason == "model_context_window_exceeded":
+            self.current_stop_reason = "model_context_window_exceeded"
+
+        self.usage = {
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+        }
+        lines = self._ensure_started()
+        lines.extend(self._close_current_block())
+        lines.append(
+            _format_anthropic_sse(
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": self.current_stop_reason,
+                        "stop_sequence": None,
+                    },
+                    "usage": dict(self.usage),
+                },
+            )
+        )
+        lines.append(_format_anthropic_sse("message_stop", {"type": "message_stop"}))
+        self.closed = True
+        return lines
+
+    def _on_error(self, data: dict[str, Any]) -> list[str]:
+        payload = data.get("error", data)
+        return [
+            _format_anthropic_sse(
+                "error",
+                {
+                    "type": "error",
+                    "error": (
+                        payload
+                        if isinstance(payload, dict)
+                        else {"message": str(payload)}
+                    ),
+                },
+            )
+        ]
+
+
+_ANTHROPIC_EVENT_HANDLERS: dict[str, Any] = {
+    "response.output_item.added": AnthropicStreamTranslator._on_output_item_added,
+    "response.output_text.delta": AnthropicStreamTranslator._on_text_delta,
+    "response.content_part.delta": AnthropicStreamTranslator._on_text_delta,
+    "response.function_call_arguments.delta": AnthropicStreamTranslator._on_function_args_delta,
+    "response.completed": AnthropicStreamTranslator._on_completed,
+    "error": AnthropicStreamTranslator._on_error,
+    "response.failed": AnthropicStreamTranslator._on_error,
 }

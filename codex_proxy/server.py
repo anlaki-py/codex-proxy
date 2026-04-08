@@ -14,7 +14,9 @@ from curl_cffi.requests.exceptions import RequestException
 from codex_proxy.auth import ensure_credentials, extract_account_id
 from codex_proxy.config import CODEX_MODELS, RESPONSES_ENDPOINT
 from codex_proxy.translator import (
+    AnthropicStreamTranslator,
     ResponseStreamTranslator,
+    anthropic_messages_to_responses,
     chat_to_responses,
 )
 
@@ -211,6 +213,44 @@ async def handle_models(request: web.Request) -> web.Response:
     )
 
 
+def _estimate_anthropic_input_tokens(payload: dict[str, Any]) -> dict[str, int]:
+    """Estimate Anthropic input tokens with a rough chars/4 heuristic."""
+    total_chars = 0
+
+    system = payload.get("system")
+    if isinstance(system, str):
+        total_chars += len(system)
+    elif isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and block.get("type") == "text":
+                total_chars += len(block.get("text", ""))
+
+    messages = payload.get("messages", [])
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                total_chars += len(content)
+                continue
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text":
+                    total_chars += len(block.get("text", ""))
+                elif block.get("type") == "tool_result":
+                    tool_content = block.get("content", "")
+                    if isinstance(tool_content, str):
+                        total_chars += len(tool_content)
+                    else:
+                        total_chars += len(json.dumps(tool_content, ensure_ascii=False))
+
+    return {"input_tokens": max(1, total_chars // 4)}
+
+
 def _build_upstream_headers(credentials: dict[str, Any], accept: str) -> dict[str, str]:
     """Build auth headers for ChatGPT backend requests."""
     access_token = credentials["access_token"]
@@ -274,7 +314,7 @@ async def _write_responses_stream_error(
     detail: str | None = None,
 ) -> web.StreamResponse:
     """Write a downstream Responses-API SSE error and terminate the stream."""
-    payload = {
+    payload: dict[str, Any] = {
         "type": "error",
         "error": {
             "message": message,
@@ -743,6 +783,154 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse | 
     )
 
 
+async def handle_messages(request: web.Request) -> web.StreamResponse | web.Response:
+    """Expose an Anthropic-compatible /v1/messages endpoint for Claude Code."""
+    try:
+        raw_body = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    client_stream = bool(raw_body.get("stream", False))
+    body = anthropic_messages_to_responses(raw_body)
+    body["stream"] = True
+    response_model = raw_body.get("model") if isinstance(raw_body.get("model"), str) else body["model"]
+
+    try:
+        credentials = await ensure_credentials()
+    except RuntimeError as e:
+        return web.json_response({"error": str(e)}, status=401)
+
+    headers = _build_upstream_headers(credentials, accept="text/event-stream")
+
+    session: AsyncSession = request.app["upstream_session"]
+    response = _make_stream_response() if client_stream else None
+    for attempt in range(1, _MAX_UPSTREAM_ATTEMPTS + 1):
+        sent_to_client = bool(response is not None and response.prepared)
+        translator = AnthropicStreamTranslator(response_model)
+        try:
+            upstream = await session.post(
+                RESPONSES_ENDPOINT,
+                json=body,
+                headers=headers,
+                stream=True,
+                timeout=_UPSTREAM_TIMEOUT_SECONDS,
+            )
+
+            if upstream.status_code != 200:
+                error_text = await _read_upstream_text(upstream)
+                log.error("Upstream /messages error %d: %s", upstream.status_code, error_text[:1000])
+                return web.json_response(
+                    _build_error_payload(error_text[:1000], "upstream_error"),
+                    status=upstream.status_code,
+                )
+
+            retry_stream = False
+            async for line_bytes in upstream.aiter_lines():
+                line = line_bytes.decode() if isinstance(line_bytes, bytes) else line_bytes
+                line = line.strip()
+                if not line or not line.startswith("data: "):
+                    continue
+
+                data_str = line[6:]
+                if data_str == "[DONE]":
+                    break
+
+                try:
+                    event_data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    log.warning("Unparseable upstream SSE data on /messages: %s", data_str[:200])
+                    continue
+
+                event_type = event_data.get("type", "")
+                if event_type in {"error", "response.failed"}:
+                    retriable_event = (
+                        not sent_to_client
+                        and attempt < _MAX_UPSTREAM_ATTEMPTS
+                        and _is_retriable_upstream_event(event_type, event_data)
+                    )
+                    log_method = log.warning if retriable_event else log.error
+                    log_method(
+                        "Upstream Anthropic event %s: %s",
+                        event_type,
+                        json.dumps(event_data)[:1000],
+                    )
+                    if retriable_event:
+                        retry_stream = True
+                        break
+                    if client_stream and response is not None:
+                        for sse_line in translator.translate_event(event_type, event_data):
+                            await _ensure_stream_prepared(response, request)
+                            await response.write(sse_line.encode())
+                        return response
+                    return web.json_response({"type": "error", "error": event_data.get("error", event_data)}, status=502)
+
+                sse_lines = translator.translate_event(event_type, event_data)
+                if client_stream and response is not None:
+                    for sse_line in sse_lines:
+                        await _ensure_stream_prepared(response, request)
+                        await response.write(sse_line.encode())
+                        sent_to_client = True
+
+            if retry_stream:
+                log.warning(
+                    "Retrying upstream /messages request after transient stream event (%d/%d)",
+                    attempt,
+                    _MAX_UPSTREAM_ATTEMPTS,
+                )
+                continue
+
+            if client_stream and response is not None:
+                await _ensure_stream_prepared(response, request)
+                return response
+
+            if translator.closed:
+                return web.json_response(translator.build_response())
+
+            return web.json_response(
+                _build_error_payload("Missing response.completed event", "upstream_error"),
+                status=502,
+            )
+
+        except Exception as e:
+            if _should_retry_upstream_error(e, attempt, sent_to_client):
+                log.warning(
+                    "Retrying upstream /messages request after transient error (%d/%d): %s",
+                    attempt,
+                    _MAX_UPSTREAM_ATTEMPTS,
+                    e,
+                )
+                continue
+
+            log.error("Connection error on /messages: %s", e)
+            if client_stream and response is not None and response.prepared:
+                error_payload = {
+                    "type": "error",
+                    "error": {"type": "connection_error", "message": str(e)},
+                }
+                await response.write(
+                    f"event: error\ndata: {json.dumps(error_payload, ensure_ascii=False)}\n\n".encode()
+                )
+                return response
+            return web.json_response(
+                _build_error_payload(str(e), "connection_error"),
+                status=502,
+            )
+
+    return web.json_response(
+        _build_error_payload("Failed to connect to upstream", "connection_error"),
+        status=502,
+    )
+
+
+async def handle_count_tokens(request: web.Request) -> web.Response:
+    """Expose Anthropic-compatible input token estimation."""
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+    return web.json_response(_estimate_anthropic_input_tokens(body), status=200)
+
+
 async def handle_responses(request: web.Request) -> web.StreamResponse | web.Response:
     """Forward OpenAI Responses API requests directly to ChatGPT backend."""
     try:
@@ -891,6 +1079,10 @@ def create_app() -> web.Application:
     app.router.add_post("/chat/completions", handle_chat_completions)
     app.router.add_post("/v1/responses", handle_responses)
     app.router.add_post("/responses", handle_responses)
+    app.router.add_post("/v1/messages", handle_messages)
+    app.router.add_post("/messages", handle_messages)
+    app.router.add_post("/v1/messages/count_tokens", handle_count_tokens)
+    app.router.add_post("/messages/count_tokens", handle_count_tokens)
     return app
 
 
@@ -903,6 +1095,6 @@ def run_server(host: str, port: int) -> None:
     app = create_app()
     log.info("Starting codex-proxy on %s:%d", host, port)
     log.info(
-        "Endpoints: POST /v1/chat/completions, POST /v1/responses, GET /v1/models, GET /health"
+        "Endpoints: POST /v1/chat/completions, POST /v1/responses, POST /v1/messages, GET /v1/models, GET /health"
     )
     web.run_app(app, host=host, port=port, print=None)

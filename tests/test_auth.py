@@ -8,8 +8,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from click.testing import CliRunner
 
-from codex_proxy import auth
-from codex_proxy import cli
+from codex_proxy import auth, cli
 
 
 def test_start_callback_server_reports_busy_port_clearly(monkeypatch):

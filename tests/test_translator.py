@@ -3,7 +3,9 @@
 import json
 
 from codex_proxy.translator import (
+    AnthropicStreamTranslator,
     ResponseStreamTranslator,
+    anthropic_messages_to_responses,
     chat_to_responses,
 )
 
@@ -225,6 +227,120 @@ class TestChatToResponses:
         }
 
 
+class TestAnthropicMessagesToResponses:
+    def test_maps_claude_model_tiers_to_two_codex_levels(self):
+        opus = anthropic_messages_to_responses({"model": "claude-opus-4-1", "messages": []})
+        sonnet = anthropic_messages_to_responses({"model": "claude-sonnet-4-5", "messages": []})
+        haiku = anthropic_messages_to_responses({"model": "claude-haiku-4-5", "messages": []})
+
+        assert opus["model"] == "gpt-5.4"
+        assert sonnet["model"] == "gpt-5.3-codex"
+        assert haiku["model"] == "gpt-5.4-mini"
+
+    def test_maps_adaptive_thinking_to_high_reasoning(self):
+        result = anthropic_messages_to_responses(
+            {
+                "model": "claude-opus-4-1",
+                "messages": [],
+                "thinking": {"type": "adaptive"},
+            }
+        )
+
+        assert result["model"] == "gpt-5.4"
+        assert result["reasoning"] == {"effort": "high"}
+
+    def test_maps_system_tools_and_tool_results(self):
+        request = {
+            "model": "claude-sonnet-4-5",
+            "system": "You are careful.",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Ping"}]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Calling tool."},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "lookup",
+                            "input": {"q": "Ping"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": "Pong",
+                        }
+                    ],
+                },
+            ],
+            "tools": [
+                {
+                    "name": "lookup",
+                    "description": "Lookup",
+                    "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
+                }
+            ],
+            "tool_choice": {"type": "tool", "name": "lookup"},
+            "stream": True,
+        }
+
+        result = anthropic_messages_to_responses(request)
+
+        assert result["instructions"] == "You are careful."
+        assert result["stream"] is True
+        assert result["tools"] == [
+            {
+                "type": "function",
+                "name": "lookup",
+                "description": "Lookup",
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+                "strict": False,
+            }
+        ]
+        assert result["tool_choice"] == {"type": "function", "name": "lookup"}
+        assert any(item.get("type") == "function_call" for item in result["input"])
+        assert any(item.get("type") == "function_call_output" for item in result["input"])
+
+    def test_flattens_system_blocks_and_text_content(self):
+        request = {
+            "model": "claude-sonnet-4-5",
+            "system": [
+                {"type": "text", "text": "Line one."},
+                {"type": "text", "text": "Line two."},
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "abc123",
+                            },
+                        },
+                    ],
+                }
+            ],
+        }
+
+        result = anthropic_messages_to_responses(request)
+
+        assert result["instructions"] == "Line one.\n\nLine two."
+        assert result["input"][0]["content"][0] == {"type": "input_text", "text": "Describe this"}
+        assert result["input"][0]["content"][1] == {
+            "type": "input_image",
+            "image_url": "data:image/png;base64,abc123",
+        }
+
+
 class TestResponseStreamTranslator:
     def test_text_streaming(self):
         t = ResponseStreamTranslator("gpt-5.1")
@@ -324,3 +440,77 @@ class TestResponseStreamTranslator:
         )
         chunk = json.loads(lines[0].removeprefix("data: ").strip())
         assert chunk["choices"][0]["finish_reason"] == "tool_calls"
+
+
+class TestAnthropicStreamTranslator:
+    def test_emits_text_and_tool_events(self):
+        translator = AnthropicStreamTranslator("gpt-5.4")
+
+        start_lines = translator.translate_event(
+            "response.output_item.added",
+            {"item": {"type": "message", "id": "msg_1", "role": "assistant"}},
+        )
+        text_lines = translator.translate_event("response.output_text.delta", {"delta": "Hello"})
+        tool_lines = translator.translate_event(
+            "response.output_item.added",
+            {
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "fc_1",
+                    "name": "lookup",
+                }
+            },
+        )
+
+        assert any("message_start" in line for line in start_lines)
+        assert any("content_block_start" in line for line in start_lines)
+        assert any("text_delta" in line for line in text_lines)
+        assert any("tool_use" in line for line in tool_lines)
+
+    def test_emits_input_json_deltas_and_message_stop(self):
+        translator = AnthropicStreamTranslator("gpt-5.4")
+        translator.translate_event(
+            "response.output_item.added",
+            {
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_2",
+                    "call_id": "fc_2",
+                    "name": "lookup",
+                }
+            },
+        )
+
+        arg_lines = translator.translate_event(
+            "response.function_call_arguments.delta",
+            {"item_id": "fc_2", "delta": '{"q":"hel'},
+        )
+        done_lines = translator.translate_event(
+            "response.completed",
+            {
+                "response": {
+                    "status": "completed",
+                    "usage": {"input_tokens": 3, "output_tokens": 5},
+                }
+            },
+        )
+
+        assert any("input_json_delta" in line for line in arg_lines)
+        assert any('"stop_reason": "tool_use"' in line for line in done_lines)
+        assert done_lines[-1].startswith("event: message_stop")
+
+    def test_completed_handles_missing_usage_details(self):
+        translator = AnthropicStreamTranslator("gpt-5.4")
+        translator.translate_event(
+            "response.output_item.added",
+            {"item": {"type": "message", "id": "msg_1", "role": "assistant"}},
+        )
+
+        done_lines = translator.translate_event(
+            "response.completed",
+            {"response": {"status": "completed", "usage": None, "incomplete_details": None}},
+        )
+
+        assert any('"input_tokens": 0' in line for line in done_lines)
+        assert done_lines[-1].startswith("event: message_stop")

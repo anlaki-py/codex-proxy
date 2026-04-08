@@ -4,10 +4,13 @@ import pytest
 
 from codex_proxy.server import (
     _aggregate_nonstream_chat_completion,
+    _estimate_anthropic_input_tokens,
     _normalize_responses_body,
     _parse_sse_data_line,
     create_app,
     handle_chat_completions,
+    handle_count_tokens,
+    handle_messages,
     handle_responses,
 )
 
@@ -30,6 +33,10 @@ def test_post_routes_include_chat_completions_and_responses():
     assert "/chat/completions" in paths
     assert "/v1/responses" in paths
     assert "/responses" in paths
+    assert "/v1/messages" in paths
+    assert "/messages" in paths
+    assert "/v1/messages/count_tokens" in paths
+    assert "/messages/count_tokens" in paths
 
 
 def test_normalize_responses_body_drops_max_output_tokens_and_sets_defaults():
@@ -361,6 +368,23 @@ def test_aggregate_nonstream_chat_completion_tool_calls():
     assert completion["choices"][0]["finish_reason"] == "tool_calls"
 
 
+def test_estimate_anthropic_input_tokens_counts_system_messages_and_tool_results():
+    payload = {
+        "system": [{"type": "text", "text": "Be careful."}],
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "World"}],
+            },
+        ],
+    }
+
+    result = _estimate_anthropic_input_tokens(payload)
+
+    assert result["input_tokens"] > 0
+
+
 class _FakeRequest:
     def __init__(self, body, app):
         self._body = body
@@ -424,6 +448,12 @@ class _FakeSession:
         upstream = self._upstreams[self.calls]
         self.calls += 1
         return upstream
+
+
+class _FakeJsonResponse:
+    def __init__(self, data, status=200):
+        self.data = data
+        self.status = status
 
 
 async def _fake_credentials():
@@ -556,3 +586,58 @@ async def test_handle_responses_stream_writes_sse_error_after_upstream_reset(mon
     assert '"type": "error"' in body
     assert "connection_error" in body
     assert body.endswith("data: [DONE]\n\n")
+
+
+@pytest.mark.asyncio
+async def test_handle_messages_streams_anthropic_events(monkeypatch):
+    session = _FakeSession(
+        [
+            _FakeUpstreamLines(
+                [
+                    'data: {"type":"response.output_item.added","item":{"type":"message","id":"msg_1","role":"assistant"}}',
+                    'data: {"type":"response.output_text.delta","delta":"Hello"}',
+                    'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"fc_1","name":"lookup"}}',
+                    'data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\\"q\\":\\"Ping\\"}"}',
+                    'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":2,"output_tokens":4}}}',
+                ]
+            )
+        ]
+    )
+    request = _FakeRequest(
+        {
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "Ping"}]}],
+            "stream": True,
+        },
+        {"upstream_session": session},
+    )
+
+    monkeypatch.setattr("codex_proxy.server.ensure_credentials", _fake_credentials)
+    monkeypatch.setattr("codex_proxy.server.web.StreamResponse", _FakeStreamResponse)
+
+    response = await handle_messages(request)
+
+    assert isinstance(response, _FakeStreamResponse)
+    body = b"".join(response.writes).decode()
+    assert "event: message_start" in body
+    assert '"type": "text_delta"' in body
+    assert '"type": "tool_use"' in body
+    assert "event: message_stop" in body
+
+
+@pytest.mark.asyncio
+async def test_handle_count_tokens_returns_estimate(monkeypatch):
+    request = _FakeRequest(
+        {
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "Hello"}]}],
+            "system": "Be careful.",
+        },
+        {"upstream_session": None},
+    )
+
+    monkeypatch.setattr("codex_proxy.server.web.json_response", _FakeJsonResponse)
+
+    response = await handle_count_tokens(request)
+
+    assert response.status == 200
+    assert response.data["input_tokens"] > 0

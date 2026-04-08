@@ -2,9 +2,14 @@
 
 Local proxy that exposes ChatGPT Codex models as an OpenAI-compatible API, using your ChatGPT Plus/Pro subscription quota.
 
+It also exposes a minimal Anthropic Messages API shim so Claude Code can use the same local proxy and still spend your ChatGPT Codex quota.
+
 ```
 Client (curl, CLINE, aider, ...) ──POST /v1/chat/completions──▶ codex-proxy ──▶ chatgpt.com/backend-api/codex/responses
               ◀── OpenAI SSE ──────────────────────────────────────────────────◀── Responses API SSE
+
+Claude Code ──POST /v1/messages──▶ codex-proxy ──▶ chatgpt.com/backend-api/codex/responses
+            ◀── Anthropic SSE ────────────────────────────────────────────────◀── Responses API SSE
 ```
 
 ## Quick Start
@@ -102,6 +107,8 @@ curl http://localhost:8787/v1/chat/completions \
 |--------|------|-------------|
 | POST | `/v1/chat/completions` | Chat completions (streaming and non-streaming) |
 | POST | `/v1/responses` | Responses API (streaming/non-streaming) |
+| POST | `/v1/messages` | Anthropic Messages API shim for Claude Code |
+| POST | `/v1/messages/count_tokens` | Approximate Anthropic input token counting |
 | GET | `/v1/models` | List available models |
 | GET | `/health` | Health check (no auth required) |
 
@@ -150,6 +157,27 @@ export OPENAI_MODEL=gpt-5.1
 ```
 
 Adjust the environment variable names to match your tool's conventions.
+
+### Claude Code
+
+Point Claude Code at the local proxy:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8787
+export ANTHROPIC_API_KEY=codex-proxy
+
+claude
+```
+
+The Anthropic-compatible layer maps Claude-style `/v1/messages` requests onto the same ChatGPT Codex backend used by the OpenAI-compatible endpoints. Claude model names are translated onto available Codex models automatically.
+
+Current model mapping is intentionally simple:
+
+- `claude-opus*` → `gpt-5.4`
+- `claude-sonnet*` → `gpt-5.3-codex`
+- `claude-haiku*` → `gpt-5.4-mini`
+
+Thinking requests are forwarded as Codex reasoning effort where possible. Streaming text and tool events are supported, but Anthropic-style visible thinking blocks are not yet re-emitted as separate Claude thinking events.
 
 ### General Pattern
 
