@@ -192,6 +192,22 @@ def anthropic_messages_to_responses(request: dict[str, Any]) -> dict[str, Any]:
     model = _normalize_model_name(request.get("model"), default="gpt-5.4")
     input_items: list[dict[str, Any]] = []
 
+    def flush_user_content(content: list[dict[str, Any]]) -> None:
+        if content:
+            input_items.append({"role": "user", "content": list(content)})
+            content.clear()
+
+    def flush_assistant_content(content: list[dict[str, Any]]) -> None:
+        if content:
+            input_items.append(
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": list(content),
+                }
+            )
+            content.clear()
+
     for msg in messages:
         if not isinstance(msg, dict):
             continue
@@ -204,6 +220,7 @@ def anthropic_messages_to_responses(request: dict[str, Any]) -> dict[str, Any]:
             for part in _as_content_blocks(content):
                 part_type = part.get("type")
                 if part_type == "tool_result":
+                    flush_user_content(text_or_media)
                     call_id = _normalize_tool_call_id(part.get("tool_use_id", ""))
                     input_items.append(
                         {
@@ -218,14 +235,14 @@ def anthropic_messages_to_responses(request: dict[str, Any]) -> dict[str, Any]:
                 if normalized_part is not None:
                     text_or_media.append(normalized_part)
 
-            if text_or_media:
-                input_items.append({"role": "user", "content": text_or_media})
+            flush_user_content(text_or_media)
 
         elif role == "assistant":
             assistant_text: list[dict[str, Any]] = []
             for part in _as_content_blocks(content):
                 part_type = part.get("type")
                 if part_type == "tool_use":
+                    flush_assistant_content(assistant_text)
                     call_id = _normalize_tool_call_id(part.get("id", ""))
                     input_items.append(
                         {
@@ -247,14 +264,7 @@ def anthropic_messages_to_responses(request: dict[str, Any]) -> dict[str, Any]:
                 if normalized_part is not None:
                     assistant_text.append(normalized_part)
 
-            if assistant_text:
-                input_items.append(
-                    {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": assistant_text,
-                    }
-                )
+            flush_assistant_content(assistant_text)
 
     body: dict[str, Any] = {
         "model": model,
@@ -743,7 +753,7 @@ class AnthropicStreamTranslator:
         item = data.get("item", {})
         item_type = item.get("type")
         if item_type == "message":
-            return self._start_text_block()
+            return self._ensure_started()
         if item_type == "function_call":
             return self._start_tool_block(item)
         return []

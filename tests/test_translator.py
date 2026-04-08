@@ -306,6 +306,47 @@ class TestAnthropicMessagesToResponses:
         assert any(item.get("type") == "function_call" for item in result["input"])
         assert any(item.get("type") == "function_call_output" for item in result["input"])
 
+    def test_preserves_assistant_content_order_around_tool_calls(self):
+        request = {
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Ping"}]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Before"},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "lookup",
+                            "input": {"q": "Ping"},
+                        },
+                        {"type": "text", "text": "After"},
+                    ],
+                },
+            ],
+        }
+
+        result = anthropic_messages_to_responses(request)
+
+        assert result["input"][1] == {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Before"}],
+        }
+        assert result["input"][2] == {
+            "type": "function_call",
+            "id": "fc_toolu_1",
+            "call_id": "fc_toolu_1",
+            "name": "lookup",
+            "arguments": '{"q": "Ping"}',
+        }
+        assert result["input"][3] == {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "After"}],
+        }
+
     def test_flattens_system_blocks_and_text_content(self):
         request = {
             "model": "claude-sonnet-4-5",
@@ -464,7 +505,6 @@ class TestAnthropicStreamTranslator:
         )
 
         assert any("message_start" in line for line in start_lines)
-        assert any("content_block_start" in line for line in start_lines)
         assert any("text_delta" in line for line in text_lines)
         assert any("tool_use" in line for line in tool_lines)
 
@@ -514,3 +554,32 @@ class TestAnthropicStreamTranslator:
 
         assert any('"input_tokens": 0' in line for line in done_lines)
         assert done_lines[-1].startswith("event: message_stop")
+
+    def test_tool_only_reply_does_not_add_empty_text_block(self):
+        translator = AnthropicStreamTranslator("gpt-5.4")
+
+        start_lines = translator.translate_event(
+            "response.output_item.added",
+            {"item": {"type": "message", "id": "msg_1", "role": "assistant"}},
+        )
+        tool_lines = translator.translate_event(
+            "response.output_item.added",
+            {
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "fc_1",
+                    "name": "lookup",
+                }
+            },
+        )
+
+        assert not any('"type": "text"' in line for line in start_lines + tool_lines)
+        assert translator.build_response()["content"] == [
+            {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "lookup",
+                "input": {},
+            }
+        ]

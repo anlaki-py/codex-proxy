@@ -626,6 +626,33 @@ async def test_handle_messages_streams_anthropic_events(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_handle_messages_nonstream_upstream_http_error_uses_anthropic_shape(monkeypatch):
+    session = _FakeSession([_FakeUpstreamContent([b"model not found"], status_code=404)])
+    request = _FakeRequest(
+        {
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "Ping"}]}],
+            "stream": False,
+        },
+        {"upstream_session": session},
+    )
+
+    monkeypatch.setattr("codex_proxy.server.ensure_credentials", _fake_credentials)
+    monkeypatch.setattr("codex_proxy.server.web.json_response", _FakeJsonResponse)
+
+    response = await handle_messages(request)
+
+    assert response.status == 404
+    assert response.data == {
+        "type": "error",
+        "error": {
+            "type": "upstream_error",
+            "message": "model not found",
+        },
+    }
+
+
+@pytest.mark.asyncio
 async def test_handle_count_tokens_returns_estimate(monkeypatch):
     request = _FakeRequest(
         {

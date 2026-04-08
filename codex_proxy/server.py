@@ -291,6 +291,16 @@ def _build_error_payload(message: str, error_type: str, detail: str | None = Non
     return {"error": error}
 
 
+def _build_anthropic_error_payload(
+    message: str, error_type: str, detail: str | None = None
+) -> dict[str, Any]:
+    """Build an Anthropic-style error payload."""
+    error: dict[str, Any] = {"message": message, "type": error_type}
+    if detail:
+        error["detail"] = detail
+    return {"type": "error", "error": error}
+
+
 async def _write_chat_stream_error(
     request: web.Request,
     response: web.StreamResponse,
@@ -788,7 +798,10 @@ async def handle_messages(request: web.Request) -> web.StreamResponse | web.Resp
     try:
         raw_body = await request.json()
     except json.JSONDecodeError:
-        return web.json_response({"error": "Invalid JSON"}, status=400)
+        return web.json_response(
+            _build_anthropic_error_payload("Invalid JSON", "invalid_request_error"),
+            status=400,
+        )
 
     client_stream = bool(raw_body.get("stream", False))
     body = anthropic_messages_to_responses(raw_body)
@@ -798,7 +811,10 @@ async def handle_messages(request: web.Request) -> web.StreamResponse | web.Resp
     try:
         credentials = await ensure_credentials()
     except RuntimeError as e:
-        return web.json_response({"error": str(e)}, status=401)
+        return web.json_response(
+            _build_anthropic_error_payload(str(e), "authentication_error"),
+            status=401,
+        )
 
     headers = _build_upstream_headers(credentials, accept="text/event-stream")
 
@@ -820,7 +836,7 @@ async def handle_messages(request: web.Request) -> web.StreamResponse | web.Resp
                 error_text = await _read_upstream_text(upstream)
                 log.error("Upstream /messages error %d: %s", upstream.status_code, error_text[:1000])
                 return web.json_response(
-                    _build_error_payload(error_text[:1000], "upstream_error"),
+                    _build_anthropic_error_payload(error_text[:1000], "upstream_error"),
                     status=upstream.status_code,
                 )
 
@@ -887,7 +903,7 @@ async def handle_messages(request: web.Request) -> web.StreamResponse | web.Resp
                 return web.json_response(translator.build_response())
 
             return web.json_response(
-                _build_error_payload("Missing response.completed event", "upstream_error"),
+                _build_anthropic_error_payload("Missing response.completed event", "upstream_error"),
                 status=502,
             )
 
@@ -912,12 +928,12 @@ async def handle_messages(request: web.Request) -> web.StreamResponse | web.Resp
                 )
                 return response
             return web.json_response(
-                _build_error_payload(str(e), "connection_error"),
+                _build_anthropic_error_payload(str(e), "connection_error"),
                 status=502,
             )
 
     return web.json_response(
-        _build_error_payload("Failed to connect to upstream", "connection_error"),
+        _build_anthropic_error_payload("Failed to connect to upstream", "connection_error"),
         status=502,
     )
 
