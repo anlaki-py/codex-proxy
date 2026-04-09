@@ -49,9 +49,27 @@ async def api_key_middleware(request: web.Request, handler):
         )
     return await handler(request)
 _UNSUPPORTED_RESPONSES_PARAMS = {
-    "max_output_tokens",
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
     "max_tokens",
     "max_completion_tokens",
+    "max_output_tokens",
+    "stop",
+    "response_format",
+    "logprobs",
+    "top_logprobs",
+    "seed",
+    "n",
+    "stream_options",
+    "user",
+    "modalities",
+    "audio",
+    "prediction",
+    "service_tier",
+    "prompt_cache_retention",
+    "safety_identifier",
 }
 _UPSTREAM_TIMEOUT_SECONDS = 120
 _MAX_UPSTREAM_ATTEMPTS = 2

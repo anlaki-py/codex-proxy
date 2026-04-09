@@ -39,19 +39,27 @@ def test_post_routes_include_chat_completions_and_responses():
     assert "/messages/count_tokens" in paths
 
 
-def test_normalize_responses_body_drops_max_output_tokens_and_sets_defaults():
+def test_normalize_responses_body_drops_unsupported_params_and_sets_defaults():
     body, client_stream = _normalize_responses_body(
         {
             "model": "gpt-5.3-codex",
             "input": "hi",
+            "temperature": 0.2,
             "max_output_tokens": 256,
             "max_completion_tokens": 123,
+            "service_tier": "default",
+            "prompt_cache_retention": {"type": "ephemeral"},
+            "safety_identifier": "factory-cli",
             "stream": False,
         }
     )
     assert client_stream is False
+    assert "temperature" not in body
     assert "max_output_tokens" not in body
     assert "max_completion_tokens" not in body
+    assert "service_tier" not in body
+    assert "prompt_cache_retention" not in body
+    assert "safety_identifier" not in body
     assert body["instructions"] == "You are a helpful assistant."
     assert body["store"] is False
     assert body["stream"] is True
