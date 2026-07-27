@@ -11,6 +11,40 @@ from click.testing import CliRunner
 from codex_proxy import auth, cli
 
 
+def test_is_termux_detects_termux_version(monkeypatch):
+    monkeypatch.setenv("TERMUX_VERSION", "0.118")
+    monkeypatch.delenv("PREFIX", raising=False)
+
+    assert auth._is_termux() is True
+
+
+def test_is_termux_detects_termux_prefix(monkeypatch):
+    monkeypatch.delenv("TERMUX_VERSION", raising=False)
+    monkeypatch.setenv("PREFIX", "/data/data/com.termux/files/usr")
+
+    assert auth._is_termux() is True
+
+
+def test_open_browser_uses_termux_launcher(monkeypatch):
+    popen_calls = []
+
+    monkeypatch.setenv("TERMUX_VERSION", "0.118")
+    monkeypatch.setattr(
+        auth.subprocess,
+        "Popen",
+        lambda *args, **kwargs: popen_calls.append((args, kwargs)),
+    )
+
+    auth._open_browser("https://example.com/login")
+
+    assert popen_calls == [
+        ((["termux-open-url", "https://example.com/login"],), {
+            "stdout": auth.subprocess.DEVNULL,
+            "stderr": auth.subprocess.DEVNULL,
+        })
+    ]
+
+
 def test_start_callback_server_reports_busy_port_clearly(monkeypatch):
     def fake_http_server(server_address, handler_class):
         del server_address, handler_class

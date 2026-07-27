@@ -36,11 +36,19 @@ def _get_proxy() -> str | None:
     return os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
 
 
+def _is_termux() -> bool:
+    """Return whether the process is running in Termux."""
+    return bool(os.environ.get("TERMUX_VERSION")) or "com.termux/files/usr" in os.environ.get(
+        "PREFIX", ""
+    )
+
+
 def _open_browser(url: str) -> None:
     """Open browser suppressing stderr noise (dbus/ALSA errors on WSL)."""
     try:
+        launcher = "termux-open-url" if _is_termux() else "xdg-open"
         subprocess.Popen(
-            ["xdg-open", url],
+            [launcher, url],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
