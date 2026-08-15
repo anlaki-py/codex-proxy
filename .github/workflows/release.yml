@@ -90,14 +90,13 @@ jobs:
 
       - name: Smoke test Unix installer
         run: |
-          test_root="$(mktemp -d)"
-          trap 'rm -rf "$test_root"' EXIT
           wheel_path="$(find "$PWD/dist" -maxdepth 1 -name 'codex_proxy-*-py3-none-any.whl' -print -quit)"
-          CODEX_PROXY_INSTALL_DIR="$test_root/install" \
-          CODEX_PROXY_BIN_DIR="$test_root/bin" \
+          python -m pip uninstall --yes codex-proxy
+          CODEX_PROXY_PYTHON="$(command -v python)" \
           CODEX_PROXY_WHEEL_URL="$wheel_path" \
             sh ./install.sh
-          "$test_root/bin/codex-proxy" --help >/dev/null
+          codex-proxy --help >/dev/null
+          python -m pip uninstall --yes codex-proxy
 
       - name: Create GitHub release
         env:

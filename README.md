@@ -45,10 +45,27 @@ codex-proxy switch <account-id>
 codex-proxy accounts --remove <account-id>
 ```
 
-The installers query the latest GitHub Release, find its versioned wheel, and reinstall it.
-Review the scripts before piping them into your shell if you prefer not to execute remote
-scripts directly. Releases are numbered automatically as `0.0.1`, `0.0.2`, and so on, and
-each one also includes a standard Python source distribution.
+The installers query the latest GitHub Release, find its versioned wheel, and install it with
+the selected Python interpreter's regular `pip`. Review the scripts before piping them into
+your shell if you prefer not to execute remote scripts directly. Releases are numbered
+automatically as `0.0.1`, `0.0.2`, and so on, and each one also includes a standard Python
+source distribution.
+
+To uninstall it with the same Python interpreter:
+
+```bash
+# Linux and macOS
+python3 -m pip uninstall codex-proxy
+```
+
+```powershell
+# Windows PowerShell
+py -3 -m pip uninstall codex-proxy
+```
+
+Set `CODEX_PROXY_PYTHON` before running the installer when you need to select a specific Python
+installation, then invoke that same Python path for uninstalling. A system-wide installation
+may require administrator or root permissions, depending on how Python is installed.
 
 For local development, clone the repository and install the editable development package:
 

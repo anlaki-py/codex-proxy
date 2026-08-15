@@ -4,7 +4,10 @@ set -eu
 
 REPOSITORY="anlaki-py/codex-proxy"
 
-if command -v python3 >/dev/null 2>&1; then
+PYTHON="${CODEX_PROXY_PYTHON:-}"
+if [ -n "$PYTHON" ]; then
+  :
+elif command -v python3 >/dev/null 2>&1; then
   PYTHON=python3
 elif command -v python >/dev/null 2>&1; then
   PYTHON=python
@@ -12,6 +15,8 @@ else
   echo "Python 3.11 or newer is required." >&2
   exit 1
 fi
+
+"$PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else "Python 3.11 or newer is required.")'
 
 WHEEL_URL="${CODEX_PROXY_WHEEL_URL:-}"
 if [ -z "$WHEEL_URL" ]; then
@@ -42,22 +47,5 @@ PY
 fi
 
 echo "Installing the latest codex-proxy wheel..."
-INSTALL_ROOT="${CODEX_PROXY_INSTALL_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/codex-proxy}"
-BIN_DIR="${CODEX_PROXY_BIN_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
-VENV_DIR="$INSTALL_ROOT/venv"
-
-mkdir -p "$INSTALL_ROOT" "$BIN_DIR"
-"$PYTHON" -m venv "$VENV_DIR"
-"$VENV_DIR/bin/python" -m pip install --upgrade pip
-"$VENV_DIR/bin/python" -m pip install --upgrade --force-reinstall "$WHEEL_URL"
-ln -sf "$VENV_DIR/bin/codex-proxy" "$BIN_DIR/codex-proxy"
-
-case ":$PATH:" in
-  *":$BIN_DIR:"*) ;;
-  *)
-    echo "Add $BIN_DIR to PATH to run codex-proxy directly:" >&2
-    echo "  export PATH=\"$BIN_DIR:\$PATH\"" >&2
-    ;;
-esac
-
-echo "Installed codex-proxy in $INSTALL_ROOT. Run 'codex-proxy login' to get started."
+"$PYTHON" -m pip install --upgrade "$WHEEL_URL"
+echo "Installed codex-proxy with $PYTHON. Run 'codex-proxy login' to get started."
