@@ -9,29 +9,44 @@ fail() {
   exit 1
 }
 
-PYTHON="${CODEX_PROXY_PYTHON:-}"
-if [ -n "$PYTHON" ]; then
-  if [ ! -x "$PYTHON" ] && ! command -v "$PYTHON" >/dev/null 2>&1; then
-    fail "CODEX_PROXY_PYTHON does not point to an executable: $PYTHON"
+try_python() {
+  candidate="$1"
+  if [ ! -x "$candidate" ] && ! command -v "$candidate" >/dev/null 2>&1; then
+    return 1
   fi
-elif command -v python3.11 >/dev/null 2>&1; then
-  PYTHON=python3.11
-elif command -v python3 >/dev/null 2>&1; then
-  PYTHON=python3
-elif command -v python >/dev/null 2>&1; then
-  PYTHON=python
-else
-  fail "Python 3.11 or newer was not found (checked python3.11, python3, and python)."
-fi
 
-if ! PYTHON_VERSION="$("$PYTHON" -c 'import platform; print(platform.python_version())')"; then
-  fail "Could not run the selected Python interpreter: $PYTHON"
-fi
-if ! "$PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
-  fail "Python 3.11 or newer is required; $PYTHON reports version $PYTHON_VERSION."
-fi
-if ! "$PYTHON" -m pip --version >/dev/null 2>&1; then
-  fail "pip is unavailable for $PYTHON. Install pip for that interpreter and try again."
+  if ! candidate_version="$("$candidate" -c 'import platform; print(platform.python_version())' 2>/dev/null)"; then
+    printf 'Skipping %s: the interpreter could not run.\n' "$candidate" >&2
+    return 1
+  fi
+  if ! "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+    printf 'Skipping %s: Python %s is older than 3.11.\n' "$candidate" "$candidate_version" >&2
+    return 1
+  fi
+  if ! "$candidate" -m pip --version >/dev/null 2>&1; then
+    printf 'Skipping %s: pip is unavailable.\n' "$candidate" >&2
+    return 1
+  fi
+
+  PYTHON="$candidate"
+  return 0
+}
+
+PYTHON=""
+requested_python="${CODEX_PROXY_PYTHON:-}"
+if [ -n "$requested_python" ]; then
+  if ! try_python "$requested_python"; then
+    fail "CODEX_PROXY_PYTHON is not a working Python 3.11+ interpreter with pip: $requested_python"
+  fi
+else
+  for candidate in python3.14 python3.13 python3.12 python3.11 python3 python; do
+    if try_python "$candidate"; then
+      break
+    fi
+  done
+  if [ -z "$PYTHON" ]; then
+    fail "No working Python 3.11 or newer with pip was found."
+  fi
 fi
 
 WHEEL_URL="${CODEX_PROXY_WHEEL_URL:-}"

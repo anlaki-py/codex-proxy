@@ -55,7 +55,8 @@ the scripts directory is not already available to the parent shell.
 
 Both installers validate Python 3.11+, pip availability, the GitHub release response, the
 installed package metadata, and the generated command. Failures stop with an actionable error
-instead of reporting a successful installation.
+instead of reporting a successful installation. The Unix installer skips broken, outdated, or
+pip-less Python candidates and tries the remaining available interpreters.
 
 To uninstall it with the same Python interpreter:
 
