@@ -13,7 +13,39 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  windows-installer-smoke:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Build test wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Smoke test Windows installer
+        shell: powershell
+        run: |
+          $wheels = @(Get-ChildItem -LiteralPath dist -Filter "codex_proxy-*-py3-none-any.whl")
+          if ($wheels.Count -ne 1) {
+              throw "Expected one test wheel; found $($wheels.Count)."
+          }
+          $env:CODEX_PROXY_PYTHON = (Get-Command python).Source
+          $env:CODEX_PROXY_WHEEL_URL = $wheels[0].FullName
+          & .\install.ps1
+          codex-proxy --help | Out-Null
+          python -m pip uninstall --yes codex-proxy
+
   release:
+    needs: windows-installer-smoke
     runs-on: ubuntu-latest
 
     steps:

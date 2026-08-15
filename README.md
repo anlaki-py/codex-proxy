@@ -49,7 +49,13 @@ The installers query the latest GitHub Release, find its versioned wheel, and in
 the selected Python interpreter's regular `pip`. Review the scripts before piping them into
 your shell if you prefer not to execute remote scripts directly. Releases are numbered
 automatically as `0.0.1`, `0.0.2`, and so on, and each one also includes a standard Python
-source distribution.
+source distribution. On Windows, the installer also adds Python's executable scripts directory
+to your user `PATH` when necessary. On Linux and macOS, it prints the exact `PATH` export when
+the scripts directory is not already available to the parent shell.
+
+Both installers validate Python 3.11+, pip availability, the GitHub release response, the
+installed package metadata, and the generated command. Failures stop with an actionable error
+instead of reporting a successful installation.
 
 To uninstall it with the same Python interpreter:
 
