@@ -1,0 +1,111 @@
+name: Build and release package
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: codex-proxy-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Determine next release version
+        id: release_version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          export RELEASE_TAGS="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name'
+          )"
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          patches = []
+          for tag in os.environ["RELEASE_TAGS"].splitlines():
+              match = re.fullmatch(r"v0\.0\.(\d+)", tag)
+              if match:
+                  patches.append(int(match.group(1)))
+
+          version = f"0.0.{max(patches, default=0) + 1}"
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"version={version}\n")
+          PY
+
+      - name: Set package version
+        env:
+          RELEASE_VERSION: ${{ steps.release_version.outputs.version }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          pyproject_path = Path("pyproject.toml")
+          pyproject = pyproject_path.read_text(encoding="utf-8")
+          updated, replacements = re.subn(
+              r'^version = "[^"]+"$',
+              f'version = "{os.environ["RELEASE_VERSION"]}"',
+              pyproject,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          if replacements != 1:
+              raise SystemExit("Expected exactly one project version in pyproject.toml")
+          pyproject_path.write_text(updated, encoding="utf-8")
+          PY
+
+      - name: Install build and test dependencies
+        run: python -m pip install --upgrade build twine -e ".[dev]"
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Run linter
+        run: ruff check .
+
+      - name: Build wheel and source distribution
+        run: python -m build
+
+      - name: Validate package metadata
+        run: python -m twine check dist/*
+
+      - name: Smoke test Unix installer
+        run: |
+          test_root="$(mktemp -d)"
+          trap 'rm -rf "$test_root"' EXIT
+          wheel_path="$(find "$PWD/dist" -maxdepth 1 -name 'codex_proxy-*-py3-none-any.whl' -print -quit)"
+          CODEX_PROXY_INSTALL_DIR="$test_root/install" \
+          CODEX_PROXY_BIN_DIR="$test_root/bin" \
+          CODEX_PROXY_WHEEL_URL="$wheel_path" \
+            sh ./install.sh
+          "$test_root/bin/codex-proxy" --help >/dev/null
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.release_version.outputs.version }}
+        run: |
+          gh release create "v$RELEASE_VERSION" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "codex-proxy $RELEASE_VERSION" \
+            --notes "Automated package build from commit $GITHUB_SHA." \
+            --latest

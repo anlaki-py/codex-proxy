@@ -15,8 +15,18 @@ Claude Code ──POST /v1/messages──▶ codex-proxy ──▶ chatgpt.com/b
 ## Quick Start
 
 ```bash
-# Install
-pip install -e ".[dev]"
+# Linux and macOS
+curl -fsSL https://raw.githubusercontent.com/anlaki-py/codex-proxy/main/install.sh | sh
+```
+
+```powershell
+# Windows PowerShell
+irm https://raw.githubusercontent.com/anlaki-py/codex-proxy/main/install.ps1 | iex
+```
+
+Then authenticate and start the proxy:
+
+```bash
 
 # Login (opens browser for ChatGPT OAuth)
 codex-proxy login
@@ -33,6 +43,17 @@ codex-proxy switch <account-id>
 
 # Remove one saved account by account id
 codex-proxy accounts --remove <account-id>
+```
+
+The installers query the latest GitHub Release, find its versioned wheel, and reinstall it.
+Review the scripts before piping them into your shell if you prefer not to execute remote
+scripts directly. Releases are numbered automatically as `0.0.1`, `0.0.2`, and so on, and
+each one also includes a standard Python source distribution.
+
+For local development, clone the repository and install the editable development package:
+
+```bash
+python -m pip install -e ".[dev]"
 ```
 
 ## Authentication

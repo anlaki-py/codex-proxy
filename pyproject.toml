@@ -4,8 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "codex-proxy"
-version = "0.1.0"
+version = "0.0.1"
 description = "Proxy server that exposes ChatGPT Codex models as an OpenAI-compatible API"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.9",
