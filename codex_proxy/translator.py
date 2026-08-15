@@ -6,6 +6,8 @@ import time
 import uuid
 from typing import Any
 
+from codex_proxy.config import DEFAULT_CODEX_MODEL
+
 log = logging.getLogger(__name__)
 
 # Parameters that the Codex/Responses API does not support.
@@ -32,9 +34,19 @@ _UNSUPPORTED_PARAMS = {
 }
 
 _CLAUDE_MODEL_ALIASES = {
-    "claude-opus": "gpt-5.4",
-    "claude-sonnet": "gpt-5.3-codex",
-    "claude-haiku": "gpt-5.4-mini",
+    "best": "gpt-5.6-sol",
+    "fable": "gpt-5.6-sol",
+    "opus": "gpt-5.6-sol",
+    "opusplan": "gpt-5.6-sol",
+    "sonnet": "gpt-5.6-terra",
+    "default": DEFAULT_CODEX_MODEL,
+    "haiku": "gpt-5.6-luna",
+}
+_CLAUDE_MODEL_PREFIXES = {
+    "claude-fable": "gpt-5.6-sol",
+    "claude-opus": "gpt-5.6-sol",
+    "claude-sonnet": "gpt-5.6-terra",
+    "claude-haiku": "gpt-5.6-luna",
 }
 
 
@@ -108,8 +120,8 @@ def chat_to_responses(request: dict[str, Any]) -> dict[str, Any]:
                 }
             )
 
-    # Strip provider prefix (e.g. "vllm/gpt-5.1" → "gpt-5.1")
-    model = _normalize_model_name(request.get("model"), default="gpt-5.1")
+    # Strip provider prefix (e.g. "vllm/gpt-5.6" → "gpt-5.6")
+    model = _normalize_model_name(request.get("model"), default=DEFAULT_CODEX_MODEL)
 
     instructions = "\n\n".join(system_parts) if system_parts else "You are a helpful assistant."
 
@@ -189,7 +201,7 @@ def anthropic_messages_to_responses(request: dict[str, Any]) -> dict[str, Any]:
     """Convert Anthropic Messages payloads into ChatGPT Responses payloads."""
     system = request.get("system")
     messages = request.get("messages", [])
-    model = _normalize_model_name(request.get("model"), default="gpt-5.4")
+    model = _normalize_model_name(request.get("model"), default=DEFAULT_CODEX_MODEL)
     input_items: list[dict[str, Any]] = []
 
     def flush_user_content(content: list[dict[str, Any]]) -> None:
@@ -309,7 +321,12 @@ def _normalize_model_name(model: Any, default: str) -> str:
     if "/" in model:
         model = model.split("/", 1)[1]
     lowered = model.lower()
-    for prefix, target in _CLAUDE_MODEL_ALIASES.items():
+    if lowered.endswith("[1m]"):
+        lowered = lowered[:-4]
+    alias_target = _CLAUDE_MODEL_ALIASES.get(lowered)
+    if alias_target:
+        return alias_target
+    for prefix, target in _CLAUDE_MODEL_PREFIXES.items():
         if lowered.startswith(prefix):
             return target
     return model

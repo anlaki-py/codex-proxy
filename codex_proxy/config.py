@@ -27,15 +27,21 @@ REGISTRY_FILE = ACCOUNTS_DIR / "registry.json"
 # Server defaults
 DEFAULT_PORT = 8787
 DEFAULT_HOST = "0.0.0.0"
+DEFAULT_CODEX_MODEL = "gpt-5.6"
 
-# Available Codex models (from pi-mono generate-models.ts)
+# ChatGPT-sign-in models documented for Codex as of 2026-08-15. GPT-5.4 and
+# GPT-5.4 Mini remain available until 2026-08-31; Codex Spark requires ChatGPT Pro.
+CODEX_MODEL_IDS = (
+    "gpt-5.6",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex-spark",
+)
 CODEX_MODELS = [
-    {"id": "gpt-5.1", "object": "model", "owned_by": "openai"},
-    {"id": "gpt-5.1-codex-max", "object": "model", "owned_by": "openai"},
-    {"id": "gpt-5.1-codex-mini", "object": "model", "owned_by": "openai"},
-    {"id": "gpt-5.2", "object": "model", "owned_by": "openai"},
-    {"id": "gpt-5.2-codex", "object": "model", "owned_by": "openai"},
-    {"id": "gpt-5.3-codex", "object": "model", "owned_by": "openai"},
-    {"id": "gpt-5.3-codex-spark", "object": "model", "owned_by": "openai"},
-    {"id": "gpt-5.4", "object": "model", "owned_by": "openai"},
+    {"id": model_id, "object": "model", "owned_by": "openai"}
+    for model_id in CODEX_MODEL_IDS
 ]

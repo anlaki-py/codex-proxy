@@ -87,19 +87,23 @@ Once the proxy is running, point any OpenAI-compatible client at it:
 curl http://localhost:8787/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer codex-proxy" \
-  -d '{"model":"gpt-5.1","messages":[{"role":"user","content":"Hello!"}],"stream":true}'
+  -d '{"model":"gpt-5.6","messages":[{"role":"user","content":"Hello!"}],"stream":true}'
 ```
 
 ### Available Models
 
-- `gpt-5.1`
-- `gpt-5.1-codex-max`
-- `gpt-5.1-codex-mini`
-- `gpt-5.2`
-- `gpt-5.2-codex`
-- `gpt-5.3-codex`
+- `gpt-5.6` (alias for GPT-5.6 Sol)
+- `gpt-5.6-sol`
+- `gpt-5.6-terra`
+- `gpt-5.6-luna`
+- `gpt-5.5`
+- `gpt-5.4` (retires from ChatGPT-sign-in Codex on August 31, 2026)
+- `gpt-5.4-mini` (retires from ChatGPT-sign-in Codex on August 31, 2026)
 - `gpt-5.3-codex-spark`
-- `gpt-5.4`
+
+`gpt-5.3-codex-spark` is a text-only preview available to ChatGPT Pro users. Older
+`gpt-5.2` and `gpt-5.3-codex` subscription models are deprecated and are no longer
+advertised by this proxy.
 
 ### Endpoints
 
@@ -122,7 +126,7 @@ codex-proxy exposes a standard OpenAI-compatible API at `http://localhost:8787/v
 import litellm
 
 response = litellm.completion(
-    model="openai/gpt-5.1",
+    model="openai/gpt-5.6",
     messages=[{"role": "user", "content": "Hello!"}],
     api_base="http://localhost:8787",
     api_key="codex-proxy",
@@ -136,7 +140,7 @@ If LiteLLM routes Codex-family calls to the Responses API, this proxy also suppo
 
 ```python
 response = litellm.responses(
-    model="openai/gpt-5.1-codex",
+    model="openai/gpt-5.6",
     input="Hello!",
     api_base="http://localhost:8787",
     api_key="codex-proxy",
@@ -153,7 +157,7 @@ Most CLI agents (e.g., aider, bub, goose) support custom base URLs. For remote a
 ```bash
 export OPENAI_API_BASE=http://<tailscale-ip>:8787/v1
 export OPENAI_API_KEY=codex-proxy
-export OPENAI_MODEL=gpt-5.1
+export OPENAI_MODEL=gpt-5.6
 ```
 
 Adjust the environment variable names to match your tool's conventions.
@@ -171,11 +175,16 @@ claude
 
 The Anthropic-compatible layer maps Claude-style `/v1/messages` requests onto the same ChatGPT Codex backend used by the OpenAI-compatible endpoints. Claude model names are translated onto available Codex models automatically.
 
-Current model mapping is intentionally simple:
+Current Claude Code aliases and full family model names are mapped by capability tier:
 
-- `claude-opus*` → `gpt-5.4`
-- `claude-sonnet*` → `gpt-5.3-codex`
-- `claude-haiku*` → `gpt-5.4-mini`
+- `best`, `fable`, `opus`, `opusplan`, `claude-fable*`, `claude-opus*` → `gpt-5.6-sol`
+- `default` → `gpt-5.6` (the proxy default)
+- `sonnet`, `claude-sonnet*` → `gpt-5.6-terra`
+- `haiku`, `claude-haiku*` → `gpt-5.6-luna`
+
+Claude Code's `[1m]` model variants map to the same Codex tier. This includes current
+first-party names such as `claude-fable-5`, `claude-opus-5`, `claude-sonnet-5`, and
+`claude-haiku-4-5`.
 
 Thinking requests are forwarded as Codex reasoning effort where possible. Streaming text and tool events are supported, but Anthropic-style visible thinking blocks are not yet re-emitted as separate Claude thinking events.
 
@@ -185,7 +194,7 @@ Thinking requests are forwarded as Codex reasoning effort where possible. Stream
 |---------|-------|
 | Base URL | `http://localhost:8787/v1` (or `http://<tailscale-ip>:8787/v1`) |
 | API Key | Value of `CODEX_PROXY_API_KEY` (default: `codex-proxy`) |
-| Model | `gpt-5.1` (or any model from the list above) |
+| Model | `gpt-5.6` (or any model from the list above) |
 
 ## How It Works
 

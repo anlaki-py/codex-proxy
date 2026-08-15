@@ -11,6 +11,11 @@ from codex_proxy.translator import (
 
 
 class TestChatToResponses:
+    def test_defaults_to_current_codex_model(self):
+        result = chat_to_responses({"messages": [{"role": "user", "content": "Hello"}]})
+
+        assert result["model"] == "gpt-5.6"
+
     def test_basic_user_message(self):
         request = {
             "model": "gpt-5.1",
@@ -228,14 +233,28 @@ class TestChatToResponses:
 
 
 class TestAnthropicMessagesToResponses:
-    def test_maps_claude_model_tiers_to_two_codex_levels(self):
-        opus = anthropic_messages_to_responses({"model": "claude-opus-4-1", "messages": []})
-        sonnet = anthropic_messages_to_responses({"model": "claude-sonnet-4-5", "messages": []})
-        haiku = anthropic_messages_to_responses({"model": "claude-haiku-4-5", "messages": []})
+    def test_maps_current_claude_code_models_to_codex_tiers(self):
+        expected_models = {
+            "best": "gpt-5.6-sol",
+            "fable": "gpt-5.6-sol",
+            "claude-fable-5": "gpt-5.6-sol",
+            "opus": "gpt-5.6-sol",
+            "opusplan": "gpt-5.6-sol",
+            "claude-opus-5": "gpt-5.6-sol",
+            "sonnet": "gpt-5.6-terra",
+            "default": "gpt-5.6",
+            "claude-sonnet-5": "gpt-5.6-terra",
+            "haiku": "gpt-5.6-luna",
+            "claude-haiku-4-5": "gpt-5.6-luna",
+            "sonnet[1m]": "gpt-5.6-terra",
+            "claude-opus-5[1m]": "gpt-5.6-sol",
+        }
 
-        assert opus["model"] == "gpt-5.4"
-        assert sonnet["model"] == "gpt-5.3-codex"
-        assert haiku["model"] == "gpt-5.4-mini"
+        for claude_model, codex_model in expected_models.items():
+            result = anthropic_messages_to_responses(
+                {"model": claude_model, "messages": []}
+            )
+            assert result["model"] == codex_model
 
     def test_maps_adaptive_thinking_to_high_reasoning(self):
         result = anthropic_messages_to_responses(
@@ -246,7 +265,7 @@ class TestAnthropicMessagesToResponses:
             }
         )
 
-        assert result["model"] == "gpt-5.4"
+        assert result["model"] == "gpt-5.6-sol"
         assert result["reasoning"] == {"effort": "high"}
 
     def test_maps_system_tools_and_tool_results(self):

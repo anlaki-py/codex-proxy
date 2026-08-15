@@ -12,7 +12,7 @@ from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import RequestException
 
 from codex_proxy.auth import ensure_credentials, extract_account_id
-from codex_proxy.config import CODEX_MODELS, RESPONSES_ENDPOINT
+from codex_proxy.config import CODEX_MODELS, DEFAULT_CODEX_MODEL, RESPONSES_ENDPOINT
 from codex_proxy.translator import (
     AnthropicStreamTranslator,
     ResponseStreamTranslator,
@@ -610,7 +610,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse | 
 
     # Translate request
     client_stream = bool(body.get("stream"))
-    model = body.get("model", "gpt-5.1")
+    model = body.get("model", DEFAULT_CODEX_MODEL)
     responses_body = chat_to_responses(body)
 
     # Build headers for ChatGPT backend
