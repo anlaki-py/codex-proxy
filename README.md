@@ -33,7 +33,7 @@ codex-proxy login
 
 # Start proxy
 codex-proxy serve                # default: 0.0.0.0:8787
-codex-proxy serve -p 9000        # custom port
+codex-proxy serve --host 127.0.0.1 -p 9000
 
 # List saved accounts with usage
 codex-proxy accounts
@@ -43,6 +43,13 @@ codex-proxy switch <account-id>
 
 # Remove one saved account by account id
 codex-proxy accounts --remove <account-id>
+
+# Show help or the installed version
+codex-proxy --help               # aliases: -h, help
+codex-proxy --version            # aliases: -v, version
+
+# Upgrade to the latest GitHub release
+codex-proxy update
 ```
 
 The installers query the latest GitHub Release, find its versioned wheel, and install it with
@@ -57,6 +64,11 @@ Both installers validate Python 3.11+, pip availability, the GitHub release resp
 installed package metadata, and the generated command. Failures stop with an actionable error
 instead of reporting a successful installation. The Unix installer skips broken, outdated, or
 pip-less Python candidates and tries the remaining available interpreters.
+
+`codex-proxy update` uses the same installation method as the installers: it validates the
+latest GitHub release and upgrades its versioned wheel with the `pip` belonging to the Python
+interpreter currently running codex-proxy. If the installed release is already current, it
+exits without changing anything.
 
 To uninstall it with the same Python interpreter:
 

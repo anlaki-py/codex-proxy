@@ -1,6 +1,8 @@
 """CLI entry point for codex-proxy."""
 
 import asyncio
+import os
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -18,6 +20,13 @@ from codex_proxy.accounts import (
     upsert_account,
 )
 from codex_proxy.config import DEFAULT_HOST, DEFAULT_PORT
+from codex_proxy.updater import (
+    UpdateError,
+    fetch_latest_release,
+    installed_version,
+    pip_update_command,
+    update_available,
+)
 from codex_proxy.usage import (
     UsageLookupError,
     fetch_usage,
@@ -26,13 +35,62 @@ from codex_proxy.usage import (
     remaining_percent,
 )
 
+HELP_CONTEXT = {"help_option_names": ["-h", "--help"]}
 
-@click.group()
+
+@click.group(context_settings=HELP_CONTEXT)
+@click.version_option(
+    installed_version(),
+    "-v",
+    "--version",
+    prog_name="codex-proxy",
+    message="%(prog)s %(version)s",
+)
 def main() -> None:
     """Codex Proxy — Use ChatGPT Codex models via an OpenAI-compatible API."""
 
 
-@main.command()
+@main.command(name="help", context_settings=HELP_CONTEXT)
+@click.pass_context
+def help_command(ctx: click.Context) -> None:
+    """Show the top-level help text."""
+    if ctx.parent is None:
+        raise click.ClickException("Unable to create the help context.")
+    click.echo(ctx.parent.get_help())
+
+
+@main.command(name="version", context_settings=HELP_CONTEXT)
+def version_command() -> None:
+    """Show the installed codex-proxy version."""
+    click.echo(f"codex-proxy {installed_version()}")
+
+
+@main.command(context_settings=HELP_CONTEXT)
+def update() -> None:
+    """Update codex-proxy to the latest GitHub release."""
+    try:
+        current_version = installed_version()
+        release = fetch_latest_release()
+        has_update = update_available(current_version, release.version)
+    except UpdateError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if not has_update:
+        click.echo(f"codex-proxy {current_version} is already up to date.")
+        return
+
+    click.echo(f"Updating codex-proxy {current_version} -> {release.version}...")
+    command = pip_update_command(release)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        os.execv(command[0], command)
+    except OSError as exc:
+        raise click.ClickException(f"Could not start pip updater: {exc}") from exc
+    raise click.ClickException("The pip updater returned without replacing the process.")
+
+
+@main.command(context_settings=HELP_CONTEXT)
 def login() -> None:
     """Authenticate with ChatGPT via OAuth PKCE."""
     from codex_proxy.auth import login as do_login
@@ -45,8 +103,8 @@ def login() -> None:
     click.echo(f"Saved account: {record['label']}")
 
 
-@main.command()
-@click.option("-h", "--host", default=DEFAULT_HOST, help="Bind address")
+@main.command(context_settings=HELP_CONTEXT)
+@click.option("--host", default=DEFAULT_HOST, help="Bind address")
 @click.option("-p", "--port", default=DEFAULT_PORT, type=int, help="Listen port")
 def serve(host: str, port: int) -> None:
     """Start the proxy server."""
@@ -55,7 +113,7 @@ def serve(host: str, port: int) -> None:
     run_server(host, port)
 
 
-@main.command()
+@main.command(context_settings=HELP_CONTEXT)
 def status() -> None:
     """Show current authentication status."""
     from codex_proxy.auth import load_credentials
@@ -188,7 +246,7 @@ def _print_accounts_table(
             click.echo(f"    usage unavailable: {row['error']}")
 
 
-@main.command(name="accounts")
+@main.command(name="accounts", context_settings=HELP_CONTEXT)
 @click.option("--remove", "remove_id", help="Delete one saved account by account id")
 def accounts_command(remove_id: str | None) -> None:
     """List stored accounts and show usage."""
@@ -213,7 +271,7 @@ def accounts_command(remove_id: str | None) -> None:
     click.echo("'*' marks the active account. Use 'switch <account_id>' to change it.")
 
 
-@main.command()
+@main.command(context_settings=HELP_CONTEXT)
 @click.argument("query", required=False)
 def switch(query: str | None) -> None:
     """Switch the active account."""

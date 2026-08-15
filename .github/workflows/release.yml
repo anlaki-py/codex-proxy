@@ -42,6 +42,7 @@ jobs:
           $env:CODEX_PROXY_WHEEL_URL = $wheels[0].FullName
           & .\install.ps1
           codex-proxy --help | Out-Null
+          codex-proxy --version
           python -m pip uninstall --yes codex-proxy
 
   release:
@@ -128,6 +129,7 @@ jobs:
           CODEX_PROXY_WHEEL_URL="$wheel_path" \
             sh ./install.sh
           codex-proxy --help >/dev/null
+          codex-proxy --version
           python -m pip uninstall --yes codex-proxy
 
       - name: Create GitHub release
